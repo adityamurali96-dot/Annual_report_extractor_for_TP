@@ -1,0 +1,232 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Annual Report Extractor</title>
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>Annual Report Extractor</h1>
+            <p class="subtitle">Extract standalone financials from annual report PDFs into Excel</p>
+        </header>
+
+        <main>
+            <div class="upload-section" id="uploadSection">
+                <div class="upload-area" id="dropZone">
+                    <div class="upload-icon">
+                        <svg width="64" height="64" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+                            <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
+                            <polyline points="14 2 14 8 20 8"/>
+                            <line x1="12" y1="18" x2="12" y2="12"/>
+                            <polyline points="9 15 12 12 15 15"/>
+                        </svg>
+                    </div>
+                    <p class="upload-text">Drop your annual report PDF here</p>
+                    <p class="upload-hint">or click to browse</p>
+                    <input type="file" id="fileInput" accept=".pdf" hidden>
+                </div>
+
+                <div class="file-info" id="fileInfo" style="display:none;">
+                    <span class="file-name" id="fileName"></span>
+                    <span class="file-size" id="fileSize"></span>
+                    <button class="btn-clear" id="clearBtn" title="Remove file">&times;</button>
+                </div>
+
+                <button class="btn-extract" id="extractBtn" disabled>
+                    <span class="btn-text">Extract Financials</span>
+                </button>
+
+                <div class="info-box">
+                    <h3>What gets extracted:</h3>
+                    <ul>
+                        <li><strong>P&L Statement</strong> - Revenue, expenses, profit, EPS</li>
+                        <li><strong>Operating Metrics</strong> - EBIT, EBITDA, margins</li>
+                        <li><strong>Expense Breakup</strong> - Detailed note breakdown with top 3 heads</li>
+                        <li><strong>Validation</strong> - Cross-checks to verify data accuracy</li>
+                    </ul>
+                </div>
+
+                {% if not has_api_key %}
+                <div class="warning-box">
+                    <strong>Note:</strong> Claude API key not configured. Using regex-based extraction (less accurate for non-standard formats). Set <code>ANTHROPIC_API_KEY</code> environment variable for AI-powered extraction.
+                </div>
+                {% endif %}
+            </div>
+
+            <div class="processing-section" id="processingSection" style="display:none;">
+                <div class="spinner"></div>
+                <p class="processing-text" id="processingText">Uploading PDF...</p>
+                <div class="progress-steps">
+                    <div class="step active" id="step1">
+                        <div class="step-dot"></div>
+                        <span>Upload</span>
+                    </div>
+                    <div class="step" id="step2">
+                        <div class="step-dot"></div>
+                        <span>Identify Sections</span>
+                    </div>
+                    <div class="step" id="step3">
+                        <div class="step-dot"></div>
+                        <span>Extract Data</span>
+                    </div>
+                    <div class="step" id="step4">
+                        <div class="step-dot"></div>
+                        <span>Generate Excel</span>
+                    </div>
+                </div>
+            </div>
+
+            <div class="error-section" id="errorSection" style="display:none;">
+                <div class="error-icon">!</div>
+                <p class="error-text" id="errorText"></p>
+                <button class="btn-retry" id="retryBtn">Try Again</button>
+            </div>
+        </main>
+
+        <footer>
+            <p>Targets standalone financial statements in Indian annual reports</p>
+        </footer>
+    </div>
+
+    <script>
+        const dropZone = document.getElementById('dropZone');
+        const fileInput = document.getElementById('fileInput');
+        const fileInfo = document.getElementById('fileInfo');
+        const fileName = document.getElementById('fileName');
+        const fileSize = document.getElementById('fileSize');
+        const clearBtn = document.getElementById('clearBtn');
+        const extractBtn = document.getElementById('extractBtn');
+        const uploadSection = document.getElementById('uploadSection');
+        const processingSection = document.getElementById('processingSection');
+        const processingText = document.getElementById('processingText');
+        const errorSection = document.getElementById('errorSection');
+        const errorText = document.getElementById('errorText');
+        const retryBtn = document.getElementById('retryBtn');
+
+        let selectedFile = null;
+
+        // Drag & drop
+        dropZone.addEventListener('click', () => fileInput.click());
+        dropZone.addEventListener('dragover', (e) => {
+            e.preventDefault();
+            dropZone.classList.add('dragover');
+        });
+        dropZone.addEventListener('dragleave', () => dropZone.classList.remove('dragover'));
+        dropZone.addEventListener('drop', (e) => {
+            e.preventDefault();
+            dropZone.classList.remove('dragover');
+            if (e.dataTransfer.files.length) handleFile(e.dataTransfer.files[0]);
+        });
+
+        fileInput.addEventListener('change', () => {
+            if (fileInput.files.length) handleFile(fileInput.files[0]);
+        });
+
+        clearBtn.addEventListener('click', () => {
+            selectedFile = null;
+            fileInput.value = '';
+            fileInfo.style.display = 'none';
+            extractBtn.disabled = true;
+            dropZone.style.display = '';
+        });
+
+        function handleFile(file) {
+            if (!file.name.toLowerCase().endsWith('.pdf')) {
+                showError('Please select a PDF file');
+                return;
+            }
+            selectedFile = file;
+            fileName.textContent = file.name;
+            fileSize.textContent = formatSize(file.size);
+            fileInfo.style.display = 'flex';
+            dropZone.style.display = 'none';
+            extractBtn.disabled = false;
+        }
+
+        function formatSize(bytes) {
+            if (bytes < 1024) return bytes + ' B';
+            if (bytes < 1048576) return (bytes / 1024).toFixed(1) + ' KB';
+            return (bytes / 1048576).toFixed(1) + ' MB';
+        }
+
+        extractBtn.addEventListener('click', async () => {
+            if (!selectedFile) return;
+
+            // Show processing
+            uploadSection.style.display = 'none';
+            errorSection.style.display = 'none';
+            processingSection.style.display = 'flex';
+            updateStep(1);
+            processingText.textContent = 'Uploading PDF...';
+
+            const formData = new FormData();
+            formData.append('file', selectedFile);
+
+            try {
+                updateStep(2);
+                processingText.textContent = 'Identifying financial sections...';
+
+                const response = await fetch('/extract', {
+                    method: 'POST',
+                    body: formData,
+                });
+
+                updateStep(3);
+                processingText.textContent = 'Extracting data & generating Excel...';
+
+                if (!response.ok) {
+                    const err = await response.json();
+                    throw new Error(err.detail || 'Extraction failed');
+                }
+
+                updateStep(4);
+                processingText.textContent = 'Download ready!';
+
+                // Download the file
+                const blob = await response.blob();
+                const url = URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = url;
+                a.download = selectedFile.name.replace('.pdf', '_financials.xlsx');
+                document.body.appendChild(a);
+                a.click();
+                document.body.removeChild(a);
+                URL.revokeObjectURL(url);
+
+                // Reset after download
+                setTimeout(() => {
+                    processingSection.style.display = 'none';
+                    uploadSection.style.display = 'block';
+                    clearBtn.click();
+                }, 2000);
+
+            } catch (err) {
+                processingSection.style.display = 'none';
+                showError(err.message);
+            }
+        });
+
+        function updateStep(n) {
+            for (let i = 1; i <= 4; i++) {
+                const el = document.getElementById('step' + i);
+                el.classList.toggle('active', i <= n);
+                el.classList.toggle('done', i < n);
+            }
+        }
+
+        function showError(msg) {
+            errorSection.style.display = 'flex';
+            errorText.textContent = msg;
+        }
+
+        retryBtn.addEventListener('click', () => {
+            errorSection.style.display = 'none';
+            uploadSection.style.display = 'block';
+            clearBtn.click();
+        });
+    </script>
+</body>
+</html>
