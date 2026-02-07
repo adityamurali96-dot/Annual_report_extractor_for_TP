@@ -1,12 +1,11 @@
 """
 FastAPI application for Annual Report Financial Extractor.
-Handles PDF upload, extraction via Claude API (with regex fallback), and Excel download.
+Handles PDF upload, extraction (regex-based parsing with optional Claude TOC verification),
+and Excel download.
 """
 
-import os
 import uuid
 import logging
-import tempfile
 from pathlib import Path
 
 from fastapi import FastAPI, UploadFile, File, HTTPException, Request
@@ -96,68 +95,100 @@ async def extract(file: UploadFile = File(...)):
 def _run_extraction(pdf_path: str, job_id: str) -> dict:
     """
     Run the extraction pipeline.
-    Uses Claude API if configured, falls back to regex-based extraction.
+    - Uses Claude API only for optional page identification (TOC verification).
+    - All data parsing (P&L, notes) is always done via regex.
     """
     from app.excel_writer import create_excel
-
-    excel_path = str(UPLOAD_DIR / f"{job_id}_output.xlsx")
-
-    if ANTHROPIC_API_KEY:
-        logger.info(f"[{job_id}] Using Claude API extraction")
-        data = _extract_with_claude(pdf_path, job_id)
-    else:
-        logger.info(f"[{job_id}] Using regex-based extraction (no API key)")
-        data = _extract_with_regex(pdf_path, job_id)
-
-    create_excel(data, excel_path)
-    logger.info(f"[{job_id}] Excel generated: {excel_path}")
-
-    return {"excel_path": excel_path, "data": data}
-
-
-def _extract_with_claude(pdf_path: str, job_id: str) -> dict:
-    """Full extraction using Claude API."""
-    from app.claude_parser import extract_with_claude
-    data = extract_with_claude(pdf_path)
-    logger.info(f"[{job_id}] Claude extraction complete. Company: {data.get('company')}")
-    return data
-
-
-def _extract_with_regex(pdf_path: str, job_id: str) -> dict:
-    """Fallback extraction using regex patterns."""
     from app.extractor import (
         find_standalone_pages, extract_pnl_regex,
         find_note_page, extract_note_breakup
     )
 
-    pages, total = find_standalone_pages(pdf_path)
-    logger.info(f"[{job_id}] Found pages: {pages} (total: {total})")
+    excel_path = str(UPLOAD_DIR / f"{job_id}_output.xlsx")
 
-    if 'pnl' not in pages:
-        raise ValueError("Could not find Standalone P&L page. "
-                         "Please ensure the PDF is an annual report with standalone statements.")
+    # ------------------------------------------------------------------
+    # Step 1: Identify pages
+    # ------------------------------------------------------------------
+    fy_current = "FY Current"
+    fy_previous = "FY Previous"
+    pages = {}
 
-    pnl = extract_pnl_regex(pdf_path, pages['pnl'])
+    if ANTHROPIC_API_KEY:
+        # Use Claude for better page identification (TOC verification only - 1 API call)
+        logger.info(f"[{job_id}] Using Claude API for page identification (TOC verification)")
+        try:
+            from app.claude_parser import identify_pages
+            page_info = identify_pages(pdf_path)
+
+            raw_pages = page_info.get("pages", {})
+            fy_current = page_info.get("fiscal_year_current", fy_current)
+            fy_previous = page_info.get("fiscal_year_previous", fy_previous)
+
+            # Normalize Claude page keys to internal convention
+            if raw_pages.get("pnl") is not None:
+                pages["pnl"] = raw_pages["pnl"]
+            if raw_pages.get("balance_sheet") is not None:
+                pages["bs"] = raw_pages["balance_sheet"]
+            if raw_pages.get("cash_flow") is not None:
+                pages["cf"] = raw_pages["cash_flow"]
+            if raw_pages.get("notes_start") is not None:
+                pages["notes_start"] = raw_pages["notes_start"]
+
+            logger.info(f"[{job_id}] Claude identified pages: {pages}, "
+                        f"FY: {fy_current} / {fy_previous}")
+        except Exception as e:
+            logger.warning(f"[{job_id}] Claude page identification failed, "
+                           f"falling back to regex: {e}")
+            pages, _ = find_standalone_pages(pdf_path)
+    else:
+        logger.info(f"[{job_id}] Using regex-based page identification (no API key)")
+        pages, _ = find_standalone_pages(pdf_path)
+
+    if "pnl" not in pages:
+        raise ValueError(
+            "Could not find Standalone P&L page. "
+            "Please ensure the PDF is an annual report with standalone statements."
+        )
+
+    # ------------------------------------------------------------------
+    # Step 2: Extract P&L using regex (always)
+    # ------------------------------------------------------------------
+    logger.info(f"[{job_id}] Extracting P&L from page {pages['pnl']} (regex)")
+    pnl = extract_pnl_regex(pdf_path, pages["pnl"])
     logger.info(f"[{job_id}] P&L extracted: {len(pnl['items'])} items")
 
+    # ------------------------------------------------------------------
+    # Step 3: Extract note breakup using regex (always)
+    # ------------------------------------------------------------------
     note_items = []
     note_total = None
-    note_num = pnl['note_refs'].get('Other expenses')
+    note_num = pnl["note_refs"].get("Other expenses")
 
     if note_num:
-        note_page, note_line = find_note_page(pdf_path, note_num, pages['pnl'], "Other expenses")
+        # Use notes_start if Claude provided it, otherwise search from P&L page
+        search_start = pages.get("notes_start", pages["pnl"])
+        note_page, note_line = find_note_page(
+            pdf_path, note_num, search_start, "Other expenses"
+        )
         if note_page is not None:
-            note_items, note_total = extract_note_breakup(pdf_path, note_page, note_line, note_num)
+            note_items, note_total = extract_note_breakup(
+                pdf_path, note_page, note_line, note_num
+            )
             logger.info(f"[{job_id}] Note {note_num}: {len(note_items)} items extracted")
 
-    return {
-        "company": pnl['company'],
-        "currency": pnl['currency'],
-        "fy_current": "FY Current",
-        "fy_previous": "FY Previous",
+    data = {
+        "company": pnl["company"],
+        "currency": pnl["currency"],
+        "fy_current": fy_current,
+        "fy_previous": fy_previous,
         "pages": pages,
         "pnl": pnl,
         "note_items": note_items,
         "note_total": note_total,
         "note_number": note_num,
     }
+
+    create_excel(data, excel_path)
+    logger.info(f"[{job_id}] Excel generated: {excel_path}")
+
+    return {"excel_path": excel_path, "data": data}
