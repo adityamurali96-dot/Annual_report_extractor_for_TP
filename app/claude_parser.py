@@ -8,7 +8,6 @@ All data extraction (P&L parsing, note breakup) is done via regex only.
 
 import json
 import logging
-import anthropic
 
 from app.config import ANTHROPIC_API_KEY
 from app.pdf_utils import extract_pdf_text
@@ -17,8 +16,18 @@ logger = logging.getLogger(__name__)
 
 CLAUDE_MODEL = "claude-sonnet-4-20250514"
 
+try:
+    import anthropic
+except ImportError:
+    anthropic = None
 
-def _get_client() -> anthropic.Anthropic:
+
+def _get_client():
+    if anthropic is None:
+        raise ImportError(
+            "The 'anthropic' package is required for TOC verification. "
+            "Install it with: pip install anthropic"
+        )
     if not ANTHROPIC_API_KEY:
         raise ValueError("ANTHROPIC_API_KEY environment variable is not set")
     return anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
