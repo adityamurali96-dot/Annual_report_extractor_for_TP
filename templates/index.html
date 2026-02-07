@@ -51,7 +51,7 @@
 
                 {% if not has_api_key %}
                 <div class="warning-box">
-                    <strong>Note:</strong> Claude API key not configured. Using regex-based extraction (less accurate for non-standard formats). Set <code>ANTHROPIC_API_KEY</code> environment variable for AI-powered extraction.
+                    <strong>Note:</strong> Claude API key not configured. Page detection uses regex pattern matching. Optionally set <code>ANTHROPIC_API_KEY</code> for improved page identification in non-standard report layouts.
                 </div>
                 {% endif %}
             </div>
