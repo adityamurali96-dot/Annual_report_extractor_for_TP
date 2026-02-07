@@ -192,3 +192,9 @@ def _run_extraction(pdf_path: str, job_id: str) -> dict:
     logger.info(f"[{job_id}] Excel generated: {excel_path}")
 
     return {"excel_path": excel_path, "data": data}
+
+
+if __name__ == "__main__":
+    import uvicorn
+    from app.config import HOST, PORT
+    uvicorn.run(app, host=HOST, port=PORT)
