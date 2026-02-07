@@ -12,4 +12,4 @@ RUN mkdir -p uploads
 
 EXPOSE 8000
 
-CMD ["python", "-m", "app.main"]
+CMD python -m app.main
