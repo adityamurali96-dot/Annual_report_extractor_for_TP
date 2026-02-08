@@ -1,10 +1,22 @@
+import sys
+import os
+
+# Add parent directory to path so we can import app modules
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
 import fitz
 import re
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 
+from app.table_extractor import (
+    find_standalone_pages as find_standalone_pages_table,
+    extract_pnl_from_tables,
+    extract_note_from_tables,
+)
+
 # ============================================================
-# UTILITY FUNCTIONS
+# UTILITY FUNCTIONS (kept for regex fallback)
 # ============================================================
 
 def parse_number(s):
@@ -49,6 +61,15 @@ def is_value_line(s):
 # ============================================================
 
 def find_standalone_pages(pdf_path):
+    """Find standalone pages using pdfplumber (primary) with PyMuPDF fallback."""
+    try:
+        pages, total = find_standalone_pages_table(pdf_path)
+        if 'pnl' in pages:
+            return pages, total
+    except Exception as e:
+        print(f"  pdfplumber page detection failed: {e}")
+
+    # Fallback to PyMuPDF regex
     doc = fitz.open(pdf_path)
     pages = {}
     for i in range(doc.page_count):
@@ -69,6 +90,23 @@ def find_standalone_pages(pdf_path):
 # ============================================================
 
 def extract_pnl(pdf_path, page_idx):
+    """Extract P&L using pdfplumber tables (primary) with regex fallback."""
+    # Primary: pdfplumber structured table extraction
+    try:
+        pnl = extract_pnl_from_tables(pdf_path, page_idx)
+        if len(pnl.get('items', {})) >= 5:
+            print(f"  pdfplumber extracted {len(pnl['items'])} P&L items")
+            return pnl
+        print(f"  pdfplumber only got {len(pnl.get('items', {}))} items, trying regex...")
+    except Exception as e:
+        print(f"  pdfplumber P&L extraction failed: {e}, trying regex...")
+
+    # Fallback: regex-based extraction
+    return _extract_pnl_regex(pdf_path, page_idx)
+
+
+def _extract_pnl_regex(pdf_path, page_idx):
+    """Legacy regex-based P&L extraction."""
     doc = fitz.open(pdf_path)
     text = doc[page_idx].get_text()
     doc.close()
@@ -102,7 +140,7 @@ def extract_pnl(pdf_path, page_idx):
     ]
 
     extracted = {}
-    note_refs = {}  # Track note references for each item
+    note_refs = {}
 
     for item_name, patterns in targets:
         for i, line in enumerate(pnl_lines):
@@ -113,7 +151,7 @@ def extract_pnl(pdf_path, page_idx):
             for j in range(i + 1, min(i + 8, len(pnl_lines))):
                 candidate = pnl_lines[j]
                 if is_note_ref(candidate) and note_ref is None:
-                    note_ref = candidate  # capture the note reference
+                    note_ref = candidate
                     continue
                 if is_value_line(candidate):
                     vals.append(parse_number(candidate))
@@ -130,11 +168,10 @@ def extract_pnl(pdf_path, page_idx):
                 note_refs[item_name] = note_ref
             break
 
-    # Detect company name from first few lines
     company = 'Unknown Company'
     for l in lines[:5]:
         if 'Limited' in l or 'Ltd' in l:
-            company = l.split('—')[0].split('–')[0].strip()
+            company = l.split('\u2014')[0].split('\u2013')[0].strip()
             break
 
     return {
@@ -176,42 +213,50 @@ def find_note_page(pdf_path, note_number, search_start_page, search_keyword="Oth
 
 
 def extract_note_breakup(pdf_path, page_idx, start_line, note_number):
-    """
-    Extract line items from a note breakup table.
-    Reads label → CY → PY pattern until it hits the total or next note heading.
-    Handles sub-items (lines starting with "- ") by prefixing parent category.
-    """
+    """Extract note breakup using pdfplumber tables (primary) with regex fallback."""
+    # Primary: pdfplumber structured table extraction
+    try:
+        note_items, note_total = extract_note_from_tables(pdf_path, page_idx, str(note_number))
+        if note_items:
+            print(f"  pdfplumber extracted {len(note_items)} note items")
+            return note_items, note_total
+        print(f"  pdfplumber got no note items, trying regex...")
+    except Exception as e:
+        print(f"  pdfplumber note extraction failed: {e}, trying regex...")
+
+    # Fallback: regex-based extraction
+    return _extract_note_breakup_regex(pdf_path, page_idx, start_line, note_number)
+
+
+def _extract_note_breakup_regex(pdf_path, page_idx, start_line, note_number):
+    """Legacy regex-based note breakup extraction."""
     doc = fitz.open(pdf_path)
     text = doc[page_idx].get_text()
     doc.close()
     lines = [l.strip() for l in text.split('\n')]
 
-    # Skip the note heading and column headers (For the year ended, March 31, In ₹ Million)
     data_start = start_line + 1
     while data_start < len(lines):
         l = lines[data_start].lower()
-        if 'for the year' in l or 'march' in l or 'in ₹' in l or l == '':
+        if 'for the year' in l or 'march' in l or 'in \u20b9' in l or l == '':
             data_start += 1
         else:
             break
 
-    # Parse line items
     note_items = []
     current_label = None
     parent_label = None
     i = data_start
-    pending_values = []  # Track consecutive values that might be the total
+    pending_values = []
 
     while i < len(lines):
         line = lines[i]
 
-        # Stop conditions: next note heading or footnote
         if line and line[0].isdigit() and '.' in line[:4] and any(c.isalpha() for c in line[5:]):
             match = re.match(r'(\d+)\.', line)
             if match and match.group(1) != str(note_number):
                 break
 
-        # Stop at footnote markers (but not "- " sub-items)
         if line.startswith('*') and len(line) > 5 and any(c.isalpha() for c in line):
             break
 
@@ -221,15 +266,14 @@ def extract_note_breakup(pdf_path, page_idx, start_line, note_number):
                 existing = next((x for x in note_items if x['label'] == current_label), None)
                 if existing and existing.get('previous') is None:
                     existing['previous'] = val
-                    current_label = None  # Both CY/PY filled, reset
+                    current_label = None
                 elif existing is None:
                     note_items.append({'label': current_label, 'current': val, 'previous': None})
             else:
-                # Value line with no current label - could be the TOTAL row
                 pending_values.append(val)
         else:
             if line:
-                pending_values = []  # Reset if we hit a label
+                pending_values = []
                 if line.startswith('- '):
                     current_label = f"{parent_label} - {line[2:]}" if parent_label else line[2:]
                 else:
@@ -238,19 +282,16 @@ def extract_note_breakup(pdf_path, page_idx, start_line, note_number):
 
         i += 1
 
-    # Clean up
     result = []
     for item in note_items:
         if item.get('previous') is None:
             item['previous'] = 0.0
         result.append(item)
 
-    # The pending_values at the end (2 consecutive values with no label) are the total
     total_item = None
     if len(pending_values) >= 2:
         total_item = {'label': 'Total Other Expenses', 'current': pending_values[0], 'previous': pending_values[1]}
     elif result:
-        # Fallback: last item might be the total
         total_item = result[-1]
 
     return result, total_item
