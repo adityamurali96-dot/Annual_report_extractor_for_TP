@@ -61,13 +61,13 @@ def is_value_line(s):
 # ============================================================
 
 def find_standalone_pages(pdf_path):
-    """Find standalone pages using pdfplumber (primary) with PyMuPDF fallback."""
+    """Find standalone pages using pymupdf4llm (primary) with PyMuPDF fallback."""
     try:
         pages, total = find_standalone_pages_table(pdf_path)
         if 'pnl' in pages:
             return pages, total
     except Exception as e:
-        print(f"  pdfplumber page detection failed: {e}")
+        print(f"  pymupdf4llm page detection failed: {e}")
 
     # Fallback to PyMuPDF regex
     doc = fitz.open(pdf_path)
@@ -90,16 +90,16 @@ def find_standalone_pages(pdf_path):
 # ============================================================
 
 def extract_pnl(pdf_path, page_idx):
-    """Extract P&L using pdfplumber tables (primary) with regex fallback."""
-    # Primary: pdfplumber structured table extraction
+    """Extract P&L using pymupdf4llm tables (primary) with regex fallback."""
+    # Primary: pymupdf4llm structured table extraction
     try:
         pnl = extract_pnl_from_tables(pdf_path, page_idx)
         if len(pnl.get('items', {})) >= 5:
-            print(f"  pdfplumber extracted {len(pnl['items'])} P&L items")
+            print(f"  pymupdf4llm extracted {len(pnl['items'])} P&L items")
             return pnl
-        print(f"  pdfplumber only got {len(pnl.get('items', {}))} items, trying regex...")
+        print(f"  pymupdf4llm only got {len(pnl.get('items', {}))} items, trying regex...")
     except Exception as e:
-        print(f"  pdfplumber P&L extraction failed: {e}, trying regex...")
+        print(f"  pymupdf4llm P&L extraction failed: {e}, trying regex...")
 
     # Fallback: regex-based extraction
     return _extract_pnl_regex(pdf_path, page_idx)
@@ -213,16 +213,16 @@ def find_note_page(pdf_path, note_number, search_start_page, search_keyword="Oth
 
 
 def extract_note_breakup(pdf_path, page_idx, start_line, note_number):
-    """Extract note breakup using pdfplumber tables (primary) with regex fallback."""
-    # Primary: pdfplumber structured table extraction
+    """Extract note breakup using pymupdf4llm tables (primary) with regex fallback."""
+    # Primary: pymupdf4llm structured table extraction
     try:
         note_items, note_total = extract_note_from_tables(pdf_path, page_idx, str(note_number))
         if note_items:
-            print(f"  pdfplumber extracted {len(note_items)} note items")
+            print(f"  pymupdf4llm extracted {len(note_items)} note items")
             return note_items, note_total
-        print(f"  pdfplumber got no note items, trying regex...")
+        print(f"  pymupdf4llm got no note items, trying regex...")
     except Exception as e:
-        print(f"  pdfplumber note extraction failed: {e}, trying regex...")
+        print(f"  pymupdf4llm note extraction failed: {e}, trying regex...")
 
     # Fallback: regex-based extraction
     return _extract_note_breakup_regex(pdf_path, page_idx, start_line, note_number)
