@@ -311,6 +311,7 @@ def _write_note_sheet(wb: Workbook, pnl: dict, note_items: list, note_total: dic
 
 def _write_validation_sheet(wb: Workbook, pnl: dict, metrics: dict,
                             note_total: dict | None, note_num: str | None,
+                            note_validation: list | None,
                             page_headers: dict, pages: dict):
     ws = wb.create_sheet("Validation")
     _set_column_widths(ws, {'A': 55, 'B': 18, 'C': 18, 'D': 12})
@@ -351,9 +352,9 @@ def _write_validation_sheet(wb: Workbook, pnl: dict, metrics: dict,
         for c in range(1, 5):
             ws.cell(row=r, column=c).border = LIGHT_BORDER
 
-    # --- Section 2: Numeric Cross-Checks ---
+    # --- Section 2: P&L Numeric Cross-Checks ---
     r += 2
-    ws.cell(row=r, column=1, value="NUMERIC CROSS-CHECKS")
+    ws.cell(row=r, column=1, value="P&L NUMERIC CROSS-CHECKS")
     for c in range(1, 5):
         ws.cell(row=r, column=c).font = SECTION_FONT
         ws.cell(row=r, column=c).fill = SECTION_FILL
@@ -362,10 +363,8 @@ def _write_validation_sheet(wb: Workbook, pnl: dict, metrics: dict,
     _write_header_row(ws, r, ['Check', 'Computed', 'Reported', 'Status'])
 
     items = pnl.get('items', {})
-    note_total_val = (note_total.get('current', 0) or 0) if note_total else 0
-    pnl_other_exp = items.get('Other expenses', {}).get('current', 0) or 0
 
-    checks = [
+    pnl_checks = [
         ('Total Income - Total Expenses = PBT',
          (items.get('Total income', {}).get('current', 0) or 0) -
          (items.get('Total expenses', {}).get('current', 0) or 0),
@@ -380,12 +379,9 @@ def _write_validation_sheet(wb: Workbook, pnl: dict, metrics: dict,
         ('EBITDA = OpProfit + Depreciation',
          metrics['current']['EBITDA'],
          metrics['current']['Operating Profit (EBIT)'] + metrics['current']['Depreciation & Amortisation']),
-        (f'Note {note_num or "?"} Total = P&L Other Expenses (CY)',
-         note_total_val,
-         pnl_other_exp),
     ]
 
-    for name, comp, rep in checks:
+    for name, comp, rep in pnl_checks:
         r += 1
         ws.cell(row=r, column=1, value=name)
         ws.cell(row=r, column=2, value=round(comp, 2)).number_format = '#,##0.00'
@@ -396,6 +392,37 @@ def _write_validation_sheet(wb: Workbook, pnl: dict, metrics: dict,
             name='Arial', bold=True,
             color='006100' if ok else 'FF0000'
         )
+
+    # --- Section 3: Other Expenses Note Validation ---
+    r += 2
+    ws.cell(row=r, column=1,
+            value=f"OTHER EXPENSES NOTE VALIDATION (Note {note_num or '?'})")
+    for c in range(1, 5):
+        ws.cell(row=r, column=c).font = SECTION_FONT
+        ws.cell(row=r, column=c).fill = SECTION_FILL
+
+    r += 1
+    _write_header_row(ws, r, ['Check', 'Actual', 'Expected', 'Status'])
+
+    if note_validation:
+        for check in note_validation:
+            r += 1
+            ws.cell(row=r, column=1, value=check['name'])
+            ws.cell(row=r, column=2, value=round(check['actual'], 2)).number_format = '#,##0.00'
+            ws.cell(row=r, column=3, value=round(check['expected'], 2)).number_format = '#,##0.00'
+            ok = check['ok']
+            ws.cell(row=r, column=4, value='PASS' if ok else 'FAIL')
+            ws.cell(row=r, column=4).font = Font(
+                name='Arial', bold=True,
+                color='006100' if ok else 'FF0000',
+            )
+            for c in range(1, 5):
+                ws.cell(row=r, column=c).border = LIGHT_BORDER
+    else:
+        r += 1
+        ws.cell(row=r, column=1, value="No note extraction was performed")
+        ws.cell(row=r, column=1).font = Font(name='Arial', size=10, italic=True,
+                                              color='808080')
 
 
 # -------------------------------------------------------------------
@@ -426,6 +453,7 @@ def create_excel(data: dict, output_path: str) -> str:
     note_items = data.get('note_items', [])
     note_total = data.get('note_total')
     note_num = data.get('note_number')
+    note_validation = data.get('note_validation')
     page_headers = data.get('page_headers', {})
     pages = data.get('pages', {})
 
@@ -440,7 +468,8 @@ def create_excel(data: dict, output_path: str) -> str:
     _write_pnl_sheet(wb, pnl, fy_current, fy_previous)
     _write_metrics_sheet(wb, metrics, company, currency, fy_current, fy_previous)
     _write_note_sheet(wb, pnl, note_items, note_total, note_num, fy_current, fy_previous)
-    _write_validation_sheet(wb, pnl, metrics, note_total, note_num, page_headers, pages)
+    _write_validation_sheet(wb, pnl, metrics, note_total, note_num,
+                            note_validation, page_headers, pages)
 
     wb.save(output_path)
     return output_path

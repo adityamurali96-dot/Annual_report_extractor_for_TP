@@ -104,7 +104,7 @@ def _run_extraction(pdf_path: str, job_id: str) -> dict:
     from app.excel_writer import create_excel
     from app.pdf_utils import extract_page_headers
     from app.docling_extractor import extract_pnl_docling, extract_note_docling
-    from app.extractor import find_note_page
+    from app.extractor import find_note_page, validate_note_extraction
 
     excel_path = str(UPLOAD_DIR / f"{job_id}_output.xlsx")
 
@@ -207,6 +207,15 @@ def _run_extraction(pdf_path: str, job_id: str) -> dict:
         logger.warning(f"[{job_id}] No note reference found for Other expenses in P&L")
 
     # ------------------------------------------------------------------
+    # Step 4b: Validate note extraction against P&L
+    # ------------------------------------------------------------------
+    validation = validate_note_extraction(pnl, note_items, note_total, note_num)
+    for check in validation:
+        status = "PASS" if check["ok"] else "FAIL"
+        logger.info(f"[{job_id}] Validation: {check['name']} -> {status} "
+                     f"(got {check['actual']:.2f}, expected {check['expected']:.2f})")
+
+    # ------------------------------------------------------------------
     # Step 5: Generate Excel with header validation
     # ------------------------------------------------------------------
     data = {
@@ -219,6 +228,7 @@ def _run_extraction(pdf_path: str, job_id: str) -> dict:
         "note_items": note_items,
         "note_total": note_total,
         "note_number": note_num,
+        "note_validation": validation,
         "page_headers": page_headers,
     }
 
