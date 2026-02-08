@@ -3,9 +3,11 @@ FROM python:3.12-slim
 WORKDIR /app
 
 # System deps needed by Docling (torch, PDF parsing, etc.)
+# libxcb1 + libx11-6 + libxext6 + libxrender1: needed by Pillow/pypdfium2 (via docling)
 RUN apt-get update -qq && \
     apt-get install -y --no-install-recommends \
-        libgomp1 libglib2.0-0 && \
+        libgomp1 libglib2.0-0 \
+        libxcb1 libx11-6 libxext6 libxrender1 && \
     rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .
