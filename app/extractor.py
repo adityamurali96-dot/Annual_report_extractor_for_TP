@@ -126,24 +126,74 @@ def extract_pnl_regex(pdf_path: str, page_idx: int) -> dict:
 
 def find_note_page(pdf_path: str, note_number: str, search_start_page: int,
                    search_keyword: str = "Other expenses") -> tuple[int | None, int | None]:
-    """Find the PDF page containing a specific note number."""
+    """
+    Find the PDF page containing a specific note number.
+
+    Uses multiple search strategies in order of specificity:
+      1. Note number + keyword on the same line (e.g., "27. Other expenses")
+      2. Note number at start of line with keyword within nearby lines (±4)
+      3. Broader search for the note number heading on any notes page
+    """
     doc = fitz.open(pdf_path)
-    note_pattern = re.compile(rf'{note_number}\.\s', re.IGNORECASE)
-    found_page = None
-    found_line = None
+    keyword_lower = search_keyword.lower()
+    note_esc = re.escape(note_number)
+
+    # ------- Strategy 1: note number + keyword on the SAME line -------
+    # Handles: "27. Other expenses", "27 - Other expenses",
+    #          "27) Other expenses", "Note 27: Other expenses"
+    same_line_patterns = [
+        re.compile(rf'^\s*{note_esc}\s*[.\-–—:)]\s*.*' + keyword_lower, re.IGNORECASE),
+        re.compile(rf'^\s*{note_esc}\s+.*' + keyword_lower, re.IGNORECASE),
+        re.compile(rf'(?:note\s+){note_esc}\s*[.\-–—:)]\s*.*' + keyword_lower, re.IGNORECASE),
+        re.compile(keyword_lower + rf'.*\b{note_esc}\b', re.IGNORECASE),
+    ]
 
     for i in range(search_start_page, doc.page_count):
         text = doc[i].get_text()
         lines = [l.strip() for l in text.split('\n')]
-        for j, l in enumerate(lines):
-            if note_pattern.match(l) and search_keyword.lower() in l.lower():
-                found_page = i
-                found_line = j
-                break
-        if found_page is not None:
-            break
+        for j, line in enumerate(lines):
+            for pat in same_line_patterns:
+                if pat.search(line):
+                    doc.close()
+                    return i, j
+
+    # ------- Strategy 2: note number at line start, keyword nearby (±4 lines) -------
+    note_start_pattern = re.compile(
+        rf'^\s*{note_esc}\s*[.\-–—:)]\s', re.IGNORECASE
+    )
+
+    for i in range(search_start_page, doc.page_count):
+        text = doc[i].get_text()
+        lines = [l.strip() for l in text.split('\n')]
+        for j, line in enumerate(lines):
+            if note_start_pattern.search(line):
+                ctx_start = max(0, j - 2)
+                ctx_end = min(len(lines), j + 6)
+                context = ' '.join(lines[ctx_start:ctx_end]).lower()
+                if keyword_lower in context or 'expense' in context:
+                    doc.close()
+                    return i, j
+
+    # ------- Strategy 3: page-level search (note number + keyword anywhere) -------
+    for i in range(search_start_page, doc.page_count):
+        text = doc[i].get_text()
+        lower_text = text.lower()
+        if keyword_lower not in lower_text:
+            continue
+        # Look for note heading pattern anywhere on the page
+        heading_match = re.search(
+            rf'(?:^|\n)\s*(?:note\s*)?{note_esc}\s*[.\-–—:)]\s',
+            text, re.IGNORECASE | re.MULTILINE,
+        )
+        if heading_match:
+            lines = [l.strip() for l in text.split('\n')]
+            for j, line in enumerate(lines):
+                if re.search(rf'(?:note\s*)?{note_esc}\s*[.\-–—:)]', line, re.IGNORECASE):
+                    doc.close()
+                    return i, j
+
     doc.close()
-    return found_page, found_line
+    return None, None
 
 
 def extract_note_breakup(pdf_path: str, page_idx: int, start_line: int,

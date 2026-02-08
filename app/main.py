@@ -185,8 +185,9 @@ def _run_extraction(pdf_path: str, job_id: str) -> dict:
     note_total = None
     note_num = pnl["note_refs"].get("Other expenses")
 
+    search_start = pages.get("notes_start", pages["pnl"])
+
     if note_num:
-        search_start = pages.get("notes_start", pages["pnl"])
         note_page, _ = find_note_page(
             pdf_path, note_num, search_start, "Other expenses"
         )
@@ -200,6 +201,10 @@ def _run_extraction(pdf_path: str, job_id: str) -> dict:
                             f"{len(note_items)} items extracted")
             except Exception as e:
                 logger.warning(f"[{job_id}] Docling note extraction failed: {e}")
+        else:
+            logger.warning(f"[{job_id}] Could not find Note {note_num} page")
+    else:
+        logger.warning(f"[{job_id}] No note reference found for Other expenses in P&L")
 
     # ------------------------------------------------------------------
     # Step 5: Generate Excel with header validation
