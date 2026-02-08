@@ -16,7 +16,7 @@ from app.pdf_utils import extract_pdf_text
 
 logger = logging.getLogger(__name__)
 
-CLAUDE_MODEL = "claude-sonnet-4-20250514"
+CLAUDE_MODEL = "claude-sonnet-4-5-20250929"
 
 try:
     import anthropic

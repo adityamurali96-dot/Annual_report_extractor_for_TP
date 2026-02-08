@@ -4,8 +4,5 @@ python-multipart==0.0.20
 jinja2==3.1.5
 PyMuPDF>=1.26.6
 openpyxl==3.1.5
-pymupdf4llm==0.2.9
-# anthropic is optional - only needed for improved TOC page detection
-# Install separately if desired: pip install anthropic==0.43.0
-# marker-pdf is optional - for full Marker framework capabilities
-# Install separately if desired: pip install marker-pdf
+docling
+anthropic
