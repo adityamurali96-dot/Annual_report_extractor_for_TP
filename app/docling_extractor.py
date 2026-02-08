@@ -6,9 +6,9 @@ Only processes the specific pages identified by Claude API (typically 2 pages),
 making extraction fast and focused.
 """
 
+import logging
 import os
 import re
-import logging
 import tempfile
 
 import fitz
@@ -25,13 +25,13 @@ def _get_converter():
     if _converter is not None:
         return _converter
 
-    from docling.document_converter import DocumentConverter, PdfFormatOption
     from docling.datamodel.base_models import InputFormat
     from docling.datamodel.pipeline_options import (
         PdfPipelineOptions,
-        TableStructureOptions,
         TableFormerMode,
+        TableStructureOptions,
     )
+    from docling.document_converter import DocumentConverter, PdfFormatOption
 
     pipeline_options = PdfPipelineOptions(
         do_table_structure=True,
@@ -192,10 +192,7 @@ def _match_pnl_item(label: str, item_name: str, patterns: list[str]) -> bool:
     if item_name in ('Basic EPS', 'Diluted EPS'):
         keyword = 'basic' if item_name == 'Basic EPS' else 'diluted'
         return label_lower.startswith(keyword)
-    for pattern in patterns:
-        if pattern in label_lower:
-            return True
-    return False
+    return any(pattern in label_lower for pattern in patterns)
 
 
 # -------------------------------------------------------------------

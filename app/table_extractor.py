@@ -12,6 +12,7 @@ financial data extraction.
 
 import logging
 import re
+
 import fitz
 import pymupdf4llm
 
@@ -224,10 +225,7 @@ def _match_pnl_item(label: str, item_name: str, patterns: list[str]) -> bool:
         keyword = 'basic' if item_name == 'Basic EPS' else 'diluted'
         return label_lower.startswith(keyword)
 
-    for pattern in patterns:
-        if pattern in label_lower:
-            return True
-    return False
+    return any(pattern in label_lower for pattern in patterns)
 
 
 def _find_best_pnl_table(tables: list[list[list[str]]], min_keyword_matches: int = 3) -> list[list[str]] | None:
@@ -441,15 +439,12 @@ def find_standalone_pages(pdf_path: str) -> tuple[dict, int]:
         text = doc[i].get_text()
         lower = text.lower()
 
-        if 'statement of profit and loss' in lower and 'standalone' in lower:
-            if 'pnl' not in pages:
-                pages['pnl'] = i
-        if 'balance sheet' in lower and 'standalone' in lower:
-            if 'bs' not in pages:
-                pages['bs'] = i
-        if 'cash flow' in lower and 'standalone' in lower:
-            if 'cf' not in pages:
-                pages['cf'] = i
+        if 'statement of profit and loss' in lower and 'standalone' in lower and 'pnl' not in pages:
+            pages['pnl'] = i
+        if 'balance sheet' in lower and 'standalone' in lower and 'bs' not in pages:
+            pages['bs'] = i
+        if 'cash flow' in lower and 'standalone' in lower and 'cf' not in pages:
+            pages['cf'] = i
 
     doc.close()
     return pages, total

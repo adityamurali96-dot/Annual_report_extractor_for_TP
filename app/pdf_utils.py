@@ -1,7 +1,8 @@
 """PDF text extraction utilities using PyMuPDF."""
 
-import fitz
 import re
+
+import fitz
 
 
 def parse_number(s: str) -> float | None:
@@ -22,11 +23,7 @@ def parse_number(s: str) -> float | None:
 def is_note_ref(s: str) -> bool:
     """Detect note reference numbers like '24', '27', or '26.1'."""
     s = s.strip()
-    if re.match(r'^\d{1,2}$', s):
-        return True
-    if re.match(r'^\d{1,2}\.\d$', s):
-        return True
-    return False
+    return bool(re.match(r'^\d{1,2}(\.\d)?$', s))
 
 
 def is_value_line(s: str) -> bool:
