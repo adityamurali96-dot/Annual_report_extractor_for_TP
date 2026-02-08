@@ -1,13 +1,12 @@
 """
 FastAPI application for Annual Report Financial Extractor.
 
-Pipeline:
-  1. Accept PDF upload (only PDF files)
-  2. Identify standalone financial statement pages (Claude API primary, regex fallback)
+Pipeline (PDF-only):
+  1. Accept PDF upload
+  2. Claude API (Sonnet 4.5) identifies standalone financial statement pages
   3. Extract page headers for company validation
-  4. Extract P&L data from identified standalone pages only
-  5. Extract note breakup from standalone notes only
-  6. Generate Excel with header validation info
+  4. Docling extracts tables from only those 2 targeted pages
+  5. Write to Excel with header validation
 """
 
 import uuid
@@ -27,7 +26,7 @@ logger = logging.getLogger(__name__)
 app = FastAPI(
     title="Annual Report Extractor",
     description="Extract standalone financials from annual report PDFs into Excel",
-    version="2.0.0",
+    version="3.0.0",
 )
 
 # Static files & templates
@@ -96,40 +95,29 @@ async def extract(file: UploadFile = File(...)):
 def _run_extraction(pdf_path: str, job_id: str) -> dict:
     """
     Run the extraction pipeline:
-      1. Identify standalone financial statement pages (Claude API or fallback)
-      2. Extract page headers for validation
-      3. Extract P&L from standalone pages only
-      4. Extract note breakup from standalone notes only
+      1. Claude API identifies standalone financial statement pages
+      2. Extract page headers for company validation
+      3. Docling extracts P&L from those targeted pages only
+      4. Docling extracts note breakup from standalone notes only
       5. Generate Excel
     """
     from app.excel_writer import create_excel
     from app.pdf_utils import extract_page_headers
-    from app.extractor import (
-        find_standalone_pages as find_standalone_pages_regex,
-        extract_pnl_regex,
-        find_note_page, extract_note_breakup,
-    )
-    from app.table_extractor import (
-        find_standalone_pages as find_standalone_pages_table,
-        extract_pnl_from_tables,
-        extract_note_from_tables,
-    )
+    from app.docling_extractor import extract_pnl_docling, extract_note_docling
+    from app.extractor import find_note_page
 
     excel_path = str(UPLOAD_DIR / f"{job_id}_output.xlsx")
 
     # ------------------------------------------------------------------
-    # Step 1: Identify standalone financial statement pages
-    # Claude API is the primary method for page identification.
-    # Falls back to pymupdf4llm/regex only if Claude is unavailable.
+    # Step 1: Identify standalone pages (Claude API primary, regex fallback)
     # ------------------------------------------------------------------
     fy_current = "FY Current"
     fy_previous = "FY Previous"
     pages = {}
-    page_headers_from_claude = {}
     company_name = None
 
     if ANTHROPIC_API_KEY:
-        logger.info(f"[{job_id}] Using Claude API to identify standalone financial pages")
+        logger.info(f"[{job_id}] Using Claude Sonnet 4.5 to identify standalone pages")
         try:
             from app.claude_parser import identify_pages
             page_info = identify_pages(pdf_path)
@@ -138,7 +126,6 @@ def _run_extraction(pdf_path: str, job_id: str) -> dict:
             fy_current = page_info.get("fiscal_year_current", fy_current)
             fy_previous = page_info.get("fiscal_year_previous", fy_previous)
             company_name = page_info.get("company_name")
-            page_headers_from_claude = page_info.get("page_headers", {})
 
             if raw_pages.get("pnl") is not None:
                 pages["pnl"] = raw_pages["pnl"]
@@ -154,16 +141,10 @@ def _run_extraction(pdf_path: str, job_id: str) -> dict:
         except Exception as e:
             logger.warning(f"[{job_id}] Claude page identification failed: {e}")
 
-    # Fallback: pymupdf4llm then regex (only if Claude didn't find pages)
-    if "pnl" not in pages:
-        logger.info(f"[{job_id}] Falling back to pymupdf4llm for page identification")
-        try:
-            pages, _ = find_standalone_pages_table(pdf_path)
-        except Exception as e:
-            logger.warning(f"[{job_id}] pymupdf4llm page identification failed: {e}")
-
+    # Fallback: regex (only if Claude didn't find pages)
     if "pnl" not in pages:
         logger.info(f"[{job_id}] Falling back to regex page identification")
+        from app.extractor import find_standalone_pages as find_standalone_pages_regex
         pages, _ = find_standalone_pages_regex(pdf_path)
 
     if "pnl" not in pages:
@@ -174,40 +155,16 @@ def _run_extraction(pdf_path: str, job_id: str) -> dict:
 
     # ------------------------------------------------------------------
     # Step 2: Extract page headers for validation
-    # Read actual headers from the PDF pages for the user to verify
-    # that the correct company (not a subsidiary) is being extracted.
     # ------------------------------------------------------------------
     page_headers = extract_page_headers(pdf_path, pages)
     logger.info(f"[{job_id}] Extracted headers from standalone pages: "
                 f"{list(page_headers.keys())}")
 
     # ------------------------------------------------------------------
-    # Step 3: Extract P&L from standalone page only
+    # Step 3: Docling extracts P&L from targeted standalone page(s)
     # ------------------------------------------------------------------
-    pnl = None
-    extraction_method = None
-
-    # Primary: pymupdf4llm structured table extraction
-    try:
-        logger.info(f"[{job_id}] Extracting P&L from standalone page {pages['pnl']} (pymupdf4llm)")
-        pnl = extract_pnl_from_tables(pdf_path, pages["pnl"])
-        item_count = len(pnl.get('items', {}))
-        logger.info(f"[{job_id}] pymupdf4llm P&L: {item_count} items extracted")
-        if item_count < 5:
-            logger.warning(f"[{job_id}] pymupdf4llm extracted only {item_count} items, "
-                           f"falling back to regex")
-            pnl = None
-        else:
-            extraction_method = "pymupdf4llm"
-    except Exception as e:
-        logger.warning(f"[{job_id}] pymupdf4llm P&L extraction failed: {e}")
-
-    # Fallback: regex-based extraction
-    if pnl is None:
-        logger.info(f"[{job_id}] Extracting P&L from standalone page {pages['pnl']} (regex)")
-        pnl = extract_pnl_regex(pdf_path, pages["pnl"])
-        extraction_method = "regex"
-        logger.info(f"[{job_id}] Regex P&L: {len(pnl['items'])} items extracted")
+    logger.info(f"[{job_id}] Docling extracting P&L from standalone page {pages['pnl']}")
+    pnl = extract_pnl_docling(pdf_path, pages["pnl"])
 
     if not pnl.get('items'):
         raise ValueError(
@@ -215,48 +172,34 @@ def _run_extraction(pdf_path: str, job_id: str) -> dict:
             f"The PDF table structure may not be supported."
         )
 
-    # Override company name with Claude-detected name if available
     if company_name:
         pnl['company'] = company_name
 
-    logger.info(f"[{job_id}] P&L extraction complete ({extraction_method}): "
-                f"{len(pnl['items'])} items - {list(pnl['items'].keys())}")
+    logger.info(f"[{job_id}] Docling P&L: {len(pnl['items'])} items - "
+                f"{list(pnl['items'].keys())}")
 
     # ------------------------------------------------------------------
-    # Step 4: Extract note breakup from standalone notes only
+    # Step 4: Docling extracts note breakup from standalone notes
     # ------------------------------------------------------------------
     note_items = []
     note_total = None
     note_num = pnl["note_refs"].get("Other expenses")
 
     if note_num:
-        # Search for notes within standalone section only
         search_start = pages.get("notes_start", pages["pnl"])
-        note_page, note_line = find_note_page(
+        note_page, _ = find_note_page(
             pdf_path, note_num, search_start, "Other expenses"
         )
         if note_page is not None:
-            # Primary: pymupdf4llm table extraction for notes
+            logger.info(f"[{job_id}] Docling extracting Note {note_num} from page {note_page}")
             try:
-                logger.info(f"[{job_id}] Extracting Note {note_num} from standalone page "
-                            f"{note_page} (pymupdf4llm)")
-                note_items, note_total = extract_note_from_tables(
+                note_items, note_total = extract_note_docling(
                     pdf_path, note_page, note_num
                 )
-                if not note_items:
-                    raise ValueError("No note items extracted")
-                logger.info(f"[{job_id}] pymupdf4llm Note {note_num}: "
+                logger.info(f"[{job_id}] Docling Note {note_num}: "
                             f"{len(note_items)} items extracted")
             except Exception as e:
-                logger.warning(f"[{job_id}] pymupdf4llm note extraction failed: {e}")
-                # Fallback: regex-based note extraction
-                if note_line is not None:
-                    logger.info(f"[{job_id}] Falling back to regex note extraction")
-                    note_items, note_total = extract_note_breakup(
-                        pdf_path, note_page, note_line, note_num
-                    )
-                    logger.info(f"[{job_id}] Regex Note {note_num}: "
-                                f"{len(note_items)} items extracted")
+                logger.warning(f"[{job_id}] Docling note extraction failed: {e}")
 
     # ------------------------------------------------------------------
     # Step 5: Generate Excel with header validation
