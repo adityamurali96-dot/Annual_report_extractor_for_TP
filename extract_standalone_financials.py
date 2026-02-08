@@ -18,7 +18,7 @@ from app.config import ANTHROPIC_API_KEY
 from app.pdf_utils import extract_page_headers
 from app.docling_extractor import extract_pnl_docling, extract_note_docling
 from app.extractor import find_standalone_pages as find_standalone_pages_regex
-from app.extractor import find_note_page, compute_metrics
+from app.extractor import find_note_page, compute_metrics, validate_note_extraction
 from app.excel_writer import create_excel
 
 
@@ -132,6 +132,17 @@ def run_extraction(pdf_path: str, output_path: str):
         print("  No note reference found for Other expenses in P&L table")
 
     # ==================================================================
+    # STAGE 4b: Validate note extraction against P&L
+    # ==================================================================
+    print("\nSTAGE 4b: Validate Note Extraction")
+
+    validation = validate_note_extraction(pnl, note_items, note_total, note_num)
+    for check in validation:
+        status = "PASS" if check["ok"] else "FAIL"
+        print(f"  [{status:4s}] {check['name']:55s} | "
+              f"Got: {check['actual']:>14,.2f}  Expected: {check['expected']:>14,.2f}")
+
+    # ==================================================================
     # STAGE 5: Compute metrics & generate Excel
     # ==================================================================
     print("\nSTAGE 5: Generate Excel")
@@ -152,6 +163,7 @@ def run_extraction(pdf_path: str, output_path: str):
         "note_items": note_items,
         "note_total": note_total,
         "note_number": note_num,
+        "note_validation": validation,
         "page_headers": page_headers,
     }
 

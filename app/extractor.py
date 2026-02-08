@@ -266,6 +266,71 @@ def extract_note_breakup(pdf_path: str, page_idx: int, start_line: int,
 
 
 # -------------------------------------------------------------------
+# Stage 2C: Validate note extraction against P&L
+# -------------------------------------------------------------------
+
+def validate_note_extraction(pnl: dict, note_items: list,
+                              note_total: dict | None,
+                              note_num: str | None,
+                              tolerance: float = 1.0) -> list[dict]:
+    """
+    Validate the extracted note breakup against P&L figures.
+
+    Returns a list of check dicts:
+        [{"name": str, "actual": float, "expected": float, "ok": bool}, ...]
+    """
+    items = pnl.get('items', {})
+    pnl_oe_cy = items.get('Other expenses', {}).get('current', 0) or 0
+    pnl_oe_py = items.get('Other expenses', {}).get('previous', 0) or 0
+
+    note_total_cy = (note_total.get('current', 0) or 0) if note_total else 0
+    note_total_py = (note_total.get('previous', 0) or 0) if note_total else 0
+
+    checks: list[dict] = []
+
+    # 1. Note total CY vs P&L Other Expenses CY
+    checks.append({
+        'name': f'Note {note_num or "?"} total (CY) vs P&L Other Expenses (CY)',
+        'actual': note_total_cy,
+        'expected': pnl_oe_cy,
+        'ok': abs(note_total_cy - pnl_oe_cy) < tolerance,
+    })
+
+    # 2. Note total PY vs P&L Other Expenses PY
+    checks.append({
+        'name': f'Note {note_num or "?"} total (PY) vs P&L Other Expenses (PY)',
+        'actual': note_total_py,
+        'expected': pnl_oe_py,
+        'ok': abs(note_total_py - pnl_oe_py) < tolerance,
+    })
+
+    # 3. Sum of individual note items vs note total (CY)
+    if note_items:
+        # Exclude the total row itself from the sum
+        non_total = [ni for ni in note_items
+                     if 'total' not in ni.get('label', '').lower()]
+        items_sum_cy = sum(ni.get('current', 0) or 0 for ni in non_total)
+        # Only check if there are non-total rows and a reported total
+        if non_total and note_total_cy:
+            checks.append({
+                'name': 'Sum of note line items (CY) vs Note total (CY)',
+                'actual': items_sum_cy,
+                'expected': note_total_cy,
+                'ok': abs(items_sum_cy - note_total_cy) < tolerance,
+            })
+
+    # 4. Note item count (informational — always "ok")
+    checks.append({
+        'name': 'Note line items extracted (count)',
+        'actual': float(len(note_items)),
+        'expected': float(len(note_items)),
+        'ok': len(note_items) > 0,
+    })
+
+    return checks
+
+
+# -------------------------------------------------------------------
 # Stage 3: Compute Metrics
 # -------------------------------------------------------------------
 
