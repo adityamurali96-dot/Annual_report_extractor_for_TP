@@ -95,13 +95,20 @@ async def extract(file: UploadFile = File(...)):
 def _run_extraction(pdf_path: str, job_id: str) -> dict:
     """
     Run the extraction pipeline.
-    - Uses Claude API only for optional page identification (TOC verification).
-    - All data parsing (P&L, notes) is always done via regex.
+    - Uses Claude API for optional page identification (TOC verification).
+    - Uses pdfplumber for structured table extraction (primary).
+    - Falls back to regex-based extraction if table extraction fails.
     """
     from app.excel_writer import create_excel
     from app.extractor import (
-        find_standalone_pages, extract_pnl_regex,
-        find_note_page, extract_note_breakup
+        find_standalone_pages as find_standalone_pages_regex,
+        extract_pnl_regex,
+        find_note_page, extract_note_breakup,
+    )
+    from app.table_extractor import (
+        find_standalone_pages as find_standalone_pages_table,
+        extract_pnl_from_tables,
+        extract_note_from_tables,
     )
 
     excel_path = str(UPLOAD_DIR / f"{job_id}_output.xlsx")
@@ -138,11 +145,19 @@ def _run_extraction(pdf_path: str, job_id: str) -> dict:
                         f"FY: {fy_current} / {fy_previous}")
         except Exception as e:
             logger.warning(f"[{job_id}] Claude page identification failed, "
-                           f"falling back to regex: {e}")
-            pages, _ = find_standalone_pages(pdf_path)
-    else:
-        logger.info(f"[{job_id}] Using regex-based page identification (no API key)")
-        pages, _ = find_standalone_pages(pdf_path)
+                           f"falling back to pdfplumber: {e}")
+
+    # If Claude didn't find pages, try pdfplumber then regex
+    if "pnl" not in pages:
+        logger.info(f"[{job_id}] Using pdfplumber for page identification")
+        try:
+            pages, _ = find_standalone_pages_table(pdf_path)
+        except Exception as e:
+            logger.warning(f"[{job_id}] pdfplumber page identification failed: {e}")
+
+    if "pnl" not in pages:
+        logger.info(f"[{job_id}] Falling back to regex page identification")
+        pages, _ = find_standalone_pages_regex(pdf_path)
 
     if "pnl" not in pages:
         raise ValueError(
@@ -151,14 +166,44 @@ def _run_extraction(pdf_path: str, job_id: str) -> dict:
         )
 
     # ------------------------------------------------------------------
-    # Step 2: Extract P&L using regex (always)
+    # Step 2: Extract P&L - try table extraction first, fall back to regex
     # ------------------------------------------------------------------
-    logger.info(f"[{job_id}] Extracting P&L from page {pages['pnl']} (regex)")
-    pnl = extract_pnl_regex(pdf_path, pages["pnl"])
-    logger.info(f"[{job_id}] P&L extracted: {len(pnl['items'])} items")
+    pnl = None
+    extraction_method = None
+
+    # Primary: pdfplumber structured table extraction
+    try:
+        logger.info(f"[{job_id}] Extracting P&L from page {pages['pnl']} (pdfplumber tables)")
+        pnl = extract_pnl_from_tables(pdf_path, pages["pnl"])
+        item_count = len(pnl.get('items', {}))
+        logger.info(f"[{job_id}] pdfplumber P&L: {item_count} items extracted")
+        if item_count < 5:
+            logger.warning(f"[{job_id}] pdfplumber extracted only {item_count} items, "
+                           f"falling back to regex")
+            pnl = None
+        else:
+            extraction_method = "pdfplumber"
+    except Exception as e:
+        logger.warning(f"[{job_id}] pdfplumber P&L extraction failed: {e}")
+
+    # Fallback: regex-based extraction
+    if pnl is None:
+        logger.info(f"[{job_id}] Extracting P&L from page {pages['pnl']} (regex fallback)")
+        pnl = extract_pnl_regex(pdf_path, pages["pnl"])
+        extraction_method = "regex"
+        logger.info(f"[{job_id}] Regex P&L: {len(pnl['items'])} items extracted")
+
+    if not pnl.get('items'):
+        raise ValueError(
+            f"Could not extract any P&L line items from page {pages['pnl']}. "
+            f"The PDF table structure may not be supported."
+        )
+
+    logger.info(f"[{job_id}] P&L extraction complete ({extraction_method}): "
+                f"{len(pnl['items'])} items - {list(pnl['items'].keys())}")
 
     # ------------------------------------------------------------------
-    # Step 3: Extract note breakup using regex (always)
+    # Step 3: Extract note breakup - try table extraction first
     # ------------------------------------------------------------------
     note_items = []
     note_total = None
@@ -171,10 +216,27 @@ def _run_extraction(pdf_path: str, job_id: str) -> dict:
             pdf_path, note_num, search_start, "Other expenses"
         )
         if note_page is not None:
-            note_items, note_total = extract_note_breakup(
-                pdf_path, note_page, note_line, note_num
-            )
-            logger.info(f"[{job_id}] Note {note_num}: {len(note_items)} items extracted")
+            # Primary: pdfplumber table extraction for notes
+            try:
+                logger.info(f"[{job_id}] Extracting Note {note_num} from page {note_page} "
+                            f"(pdfplumber tables)")
+                note_items, note_total = extract_note_from_tables(
+                    pdf_path, note_page, note_num
+                )
+                if not note_items:
+                    raise ValueError("No note items extracted")
+                logger.info(f"[{job_id}] pdfplumber Note {note_num}: "
+                            f"{len(note_items)} items extracted")
+            except Exception as e:
+                logger.warning(f"[{job_id}] pdfplumber note extraction failed: {e}")
+                # Fallback: regex-based note extraction
+                if note_line is not None:
+                    logger.info(f"[{job_id}] Falling back to regex note extraction")
+                    note_items, note_total = extract_note_breakup(
+                        pdf_path, note_page, note_line, note_num
+                    )
+                    logger.info(f"[{job_id}] Regex Note {note_num}: "
+                                f"{len(note_items)} items extracted")
 
     data = {
         "company": pnl["company"],
