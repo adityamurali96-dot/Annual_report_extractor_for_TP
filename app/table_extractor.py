@@ -1,25 +1,21 @@
 """
 Structured table extraction from PDF financial statements.
 
-Uses pdfplumber for reliable table detection and extraction, replacing
-the fragile regex-on-raw-text approach. pdfplumber understands table layout
-(borders, text alignment) and returns structured row/column data.
+Uses pymupdf4llm (the core engine behind the Marker framework) for converting
+PDF pages to markdown with proper table structure preserved. This replaces
+the fragile regex-on-raw-text approach that lost all table layout information.
 
-Optionally uses Docling for enhanced document understanding when available.
+pymupdf4llm leverages PyMuPDF's layout analysis and table detection engine
+to output well-structured markdown tables, which are then parsed for
+financial data extraction.
 """
 
 import logging
 import re
-import pdfplumber
+import fitz
+import pymupdf4llm
 
 logger = logging.getLogger(__name__)
-
-# Optional Docling support (heavy dependency - PyTorch etc.)
-try:
-    from docling.document_converter import DocumentConverter
-    DOCLING_AVAILABLE = True
-except ImportError:
-    DOCLING_AVAILABLE = False
 
 
 # -------------------------------------------------------------------
@@ -31,7 +27,7 @@ def _parse_number(s) -> float | None:
     if s is None:
         return None
     s = str(s).strip()
-    if s in ['-', '', 'None', 'nan', '\u2014', '\u2013', 'Nil', 'nil', '- ']:
+    if s in ['-', '', 'None', 'nan', '\u2014', '\u2013', 'Nil', 'nil', '- ', '\u2012']:
         return 0.0
     s = s.replace(',', '').replace(' ', '').replace('\u00a0', '')
     neg = s.startswith('(') and s.endswith(')')
@@ -51,127 +47,94 @@ def _is_note_ref(s: str) -> bool:
 
 
 # -------------------------------------------------------------------
-# Table extraction from PDF pages
+# Markdown table extraction via pymupdf4llm
 # -------------------------------------------------------------------
 
-def _extract_tables_from_pages(pdf_path: str, page_indices: list[int]) -> list[list[list]]:
-    """Extract all tables from specified PDF pages using pdfplumber."""
+def _extract_markdown_tables(pdf_path: str, page_indices: list[int]) -> list[list[list[str]]]:
+    """
+    Extract tables from PDF pages by converting to markdown via pymupdf4llm,
+    then parsing the markdown table syntax.
+
+    Tries multiple table detection strategies for robustness.
+    """
     all_tables = []
-    with pdfplumber.open(pdf_path) as pdf:
-        for page_idx in page_indices:
-            if page_idx >= len(pdf.pages):
-                continue
-            page = pdf.pages[page_idx]
 
-            # Strategy 1: Line-based detection (bordered tables)
-            tables = page.extract_tables({
-                "vertical_strategy": "lines",
-                "horizontal_strategy": "lines",
-            })
-            if tables:
-                all_tables.extend(tables)
-                continue
+    for strategy in ['lines_strict', 'lines', 'text']:
+        try:
+            md = pymupdf4llm.to_markdown(
+                pdf_path,
+                pages=page_indices,
+                table_strategy=strategy,
+            )
+        except Exception as e:
+            logger.warning(f"pymupdf4llm strategy '{strategy}' failed: {e}")
+            continue
 
-            # Strategy 2: Text-based detection (uses text alignment)
-            tables = page.extract_tables({
-                "vertical_strategy": "text",
-                "horizontal_strategy": "text",
-                "snap_x_tolerance": 5,
-                "snap_y_tolerance": 5,
-                "join_x_tolerance": 5,
-                "join_y_tolerance": 5,
-            })
-            if tables:
-                all_tables.extend(tables)
-                continue
-
-            # Strategy 3: Minimal settings - just try to find any table
-            tables = page.extract_tables()
-            if tables:
-                all_tables.extend(tables)
+        tables = _parse_markdown_tables(md)
+        if tables:
+            logger.info(f"Strategy '{strategy}' found {len(tables)} tables "
+                        f"({sum(len(t) for t in tables)} total rows)")
+            all_tables.extend(tables)
+            break  # Use first successful strategy
 
     return all_tables
 
 
-def _extract_text_lines_with_positions(pdf_path: str, page_idx: int) -> list[dict]:
+def _parse_markdown_tables(md_text: str) -> list[list[list[str]]]:
     """
-    Extract text with positional data for position-based table reconstruction.
-    Returns words grouped by line (y-position).
+    Parse markdown text to extract all tables.
+    Each table is a list of rows, each row is a list of cell strings.
     """
-    with pdfplumber.open(pdf_path) as pdf:
-        if page_idx >= len(pdf.pages):
-            return []
-        page = pdf.pages[page_idx]
-        words = page.extract_words(
-            x_tolerance=3,
-            y_tolerance=3,
-            keep_blank_chars=True,
-        )
-    return words
+    tables = []
+    current_table = []
+    in_table = False
 
-
-def _reconstruct_table_from_words(words: list[dict], page_width: float = 612) -> list[list[str]]:
-    """
-    Reconstruct table structure from positioned words when extract_tables() fails.
-    Groups words into rows by y-position, then into columns by x-position.
-    """
-    if not words:
-        return []
-
-    # Group words by line (y-position with tolerance)
-    y_tolerance = 3
-    lines = []
-    current_line = [words[0]]
-    for w in words[1:]:
-        if abs(w['top'] - current_line[0]['top']) <= y_tolerance:
-            current_line.append(w)
+    for line in md_text.split('\n'):
+        line = line.strip()
+        if line.startswith('|') and line.endswith('|'):
+            # Skip separator rows (|---|---|...)
+            inner = line[1:-1]  # strip outer pipes
+            if all(c in '-: |' for c in inner):
+                continue
+            cells = [c.strip() for c in line.split('|')[1:-1]]
+            current_table.append(cells)
+            in_table = True
         else:
-            lines.append(sorted(current_line, key=lambda x: x['x0']))
-            current_line = [w]
-    if current_line:
-        lines.append(sorted(current_line, key=lambda x: x['x0']))
+            if in_table and current_table:
+                if len(current_table) >= 2:  # Meaningful table (header + data)
+                    tables.append(current_table)
+                current_table = []
+                in_table = False
 
-    # Determine column boundaries from all words
-    # For financial tables: typically label (left), note ref (middle), values (right)
-    all_x = [w['x0'] for line in lines for w in line]
-    if not all_x:
-        return []
+    # Don't forget the last table
+    if current_table and len(current_table) >= 2:
+        tables.append(current_table)
 
-    # Use page_width to determine column regions
-    # Heuristic: label column is 0-50% of width, values are in the right 50%
-    mid_x = page_width * 0.45
-    right_mid = page_width * 0.7
+    return tables
 
-    table = []
-    for line_words in lines:
-        label_parts = []
-        mid_val = None
-        right_val = None
-        for w in line_words:
-            if w['x0'] < mid_x:
-                label_parts.append(w['text'])
-            elif w['x0'] < right_mid:
-                mid_val = w['text']
-            else:
-                right_val = w['text']
 
-        label = ' '.join(label_parts).strip()
-        if label or mid_val or right_val:
-            table.append([label, mid_val or '', right_val or ''])
-
-    return table
+def _extract_full_page_markdown(pdf_path: str, page_indices: list[int]) -> str:
+    """Get the full markdown text for pages (used for company name detection etc.)."""
+    try:
+        return pymupdf4llm.to_markdown(
+            pdf_path,
+            pages=page_indices,
+            table_strategy='lines_strict',
+        )
+    except Exception:
+        return ''
 
 
 # -------------------------------------------------------------------
 # Column identification
 # -------------------------------------------------------------------
 
-def _identify_value_columns(table: list[list]) -> tuple[int, int, int]:
+def _identify_value_columns(table: list[list[str]]) -> tuple[int, int, int]:
     """
     Identify label column and two value columns from a table.
     Returns (label_col, current_year_col, previous_year_col).
 
-    In Indian financial statements: current year is typically the first value
+    In Indian financial statements: current year is the first value
     column (left), previous year is the second (right).
     """
     if not table or len(table) < 2:
@@ -192,25 +155,21 @@ def _identify_value_columns(table: list[list]) -> tuple[int, int, int]:
 
     min_threshold = max(1, len(table) * 0.15)
 
-    # Collect columns with enough numeric data
+    # Collect columns with enough numeric data (exclude first column - labels)
     value_candidates = [
         (c, cnt) for c, cnt in enumerate(numeric_counts)
-        if cnt >= min_threshold and c > 0  # exclude first column (labels)
+        if cnt >= min_threshold and c > 0
     ]
-
-    # Sort by column position (left to right)
     value_candidates.sort(key=lambda x: x[0])
 
     if len(value_candidates) >= 2:
-        # Current year = first (leftmost) value column
-        # Previous year = second value column
+        # Second-to-last = current year, last = previous year
         curr_col = value_candidates[-2][0]
         prev_col = value_candidates[-1][0]
     elif len(value_candidates) == 1:
         curr_col = value_candidates[0][0]
         prev_col = -1
     else:
-        # Fallback: use last two columns
         curr_col = ncols - 2 if ncols >= 3 else ncols - 1
         prev_col = ncols - 1 if ncols >= 3 else -1
 
@@ -260,10 +219,10 @@ def _match_pnl_item(label: str, item_name: str, patterns: list[str]) -> bool:
     if not label_lower:
         return False
 
-    # For EPS, need special handling - match "Basic" or "Diluted" but not sub-items
+    # For EPS, match "Basic" or "Diluted" at start
     if item_name in ('Basic EPS', 'Diluted EPS'):
         keyword = 'basic' if item_name == 'Basic EPS' else 'diluted'
-        return label_lower.startswith(keyword) and 'eps' not in label_lower.split()[0]
+        return label_lower.startswith(keyword)
 
     for pattern in patterns:
         if pattern in label_lower:
@@ -271,7 +230,7 @@ def _match_pnl_item(label: str, item_name: str, patterns: list[str]) -> bool:
     return False
 
 
-def _find_best_pnl_table(tables: list[list[list]], min_keyword_matches: int = 3) -> list[list] | None:
+def _find_best_pnl_table(tables: list[list[list[str]]], min_keyword_matches: int = 3) -> list[list[str]] | None:
     """Find the table that best matches a P&L statement."""
     pnl_keywords = [
         'revenue from operations', 'profit before tax', 'profit for the year',
@@ -285,7 +244,6 @@ def _find_best_pnl_table(tables: list[list[list]], min_keyword_matches: int = 3)
     for table in tables:
         if len(table) < 3:
             continue
-        # Flatten all text in the table
         text = ' '.join(
             str(cell or '').lower()
             for row in table
@@ -301,7 +259,7 @@ def _find_best_pnl_table(tables: list[list[list]], min_keyword_matches: int = 3)
 
 def extract_pnl_from_tables(pdf_path: str, pnl_page: int) -> dict:
     """
-    Extract P&L data using pdfplumber table extraction.
+    Extract P&L data using pymupdf4llm markdown table extraction.
 
     Args:
         pdf_path: Path to the PDF file
@@ -310,32 +268,24 @@ def extract_pnl_from_tables(pdf_path: str, pnl_page: int) -> dict:
     Returns:
         Dict with keys: company, currency, items, note_refs
     """
-    # Extract tables from P&L page and next page (P&L often spans 2 pages)
+    doc = fitz.open(pdf_path)
+    total_pages = doc.page_count
+    doc.close()
+
+    # P&L often spans 2 pages
     pages_to_try = [pnl_page]
-    if pnl_page + 1 < _get_page_count(pdf_path):
+    if pnl_page + 1 < total_pages:
         pages_to_try.append(pnl_page + 1)
 
-    tables = _extract_tables_from_pages(pdf_path, pages_to_try)
-    logger.info(f"pdfplumber found {len(tables)} tables on P&L pages {pages_to_try}")
-
-    # If no tables found, try word-based reconstruction
-    if not tables:
-        logger.info("No tables via extract_tables(), trying word-based reconstruction")
-        for page_idx in pages_to_try:
-            words = _extract_text_lines_with_positions(pdf_path, page_idx)
-            if words:
-                page_width = _get_page_width(pdf_path, page_idx)
-                reconstructed = _reconstruct_table_from_words(words, page_width)
-                if len(reconstructed) > 5:
-                    tables.append(reconstructed)
+    tables = _extract_markdown_tables(pdf_path, pages_to_try)
+    logger.info(f"pymupdf4llm found {len(tables)} tables on P&L pages {pages_to_try}")
 
     if not tables:
-        raise ValueError("No tables could be extracted from P&L pages")
+        raise ValueError(f"No tables found on P&L pages {pages_to_try}")
 
     # Find the P&L table
     pnl_table = _find_best_pnl_table(tables)
     if pnl_table is None:
-        # Use the largest table as fallback
         pnl_table = max(tables, key=len)
         logger.warning("Could not identify P&L table by keywords, using largest table")
 
@@ -357,8 +307,8 @@ def extract_pnl_from_tables(pdf_path: str, pnl_page: int) -> dict:
             if not _match_pnl_item(label, item_name, patterns):
                 continue
 
-            curr_val = _parse_number(row[curr_col]) if curr_col >= 0 and curr_col < len(row) else None
-            prev_val = _parse_number(row[prev_col]) if prev_col >= 0 and prev_col < len(row) else None
+            curr_val = _parse_number(row[curr_col]) if 0 <= curr_col < len(row) else None
+            prev_val = _parse_number(row[prev_col]) if 0 <= prev_col < len(row) else None
 
             if curr_val is not None:
                 extracted[item_name] = {
@@ -373,9 +323,9 @@ def extract_pnl_from_tables(pdf_path: str, pnl_page: int) -> dict:
                         if _is_note_ref(cell):
                             note_refs[item_name] = cell
                             break
-                break  # Found this item, move to next
+                break
 
-    # Detect company name from first page text
+    # Detect company name
     company = _detect_company_name(pdf_path, pnl_page)
 
     logger.info(f"Extracted {len(extracted)} P&L items: {list(extracted.keys())}")
@@ -397,7 +347,7 @@ def extract_pnl_from_tables(pdf_path: str, pnl_page: int) -> dict:
 def extract_note_from_tables(pdf_path: str, note_page: int,
                               note_number: str) -> tuple[list[dict], dict | None]:
     """
-    Extract note breakup using pdfplumber table extraction.
+    Extract note breakup using pymupdf4llm markdown table extraction.
 
     Args:
         pdf_path: Path to PDF
@@ -407,29 +357,21 @@ def extract_note_from_tables(pdf_path: str, note_page: int,
     Returns:
         Tuple of (list of note items, total item or None)
     """
-    # Extract from note page and potentially next page
+    doc = fitz.open(pdf_path)
+    total_pages = doc.page_count
+    doc.close()
+
     pages_to_try = [note_page]
-    if note_page + 1 < _get_page_count(pdf_path):
+    if note_page + 1 < total_pages:
         pages_to_try.append(note_page + 1)
 
-    tables = _extract_tables_from_pages(pdf_path, pages_to_try)
-    logger.info(f"pdfplumber found {len(tables)} tables on note pages {pages_to_try}")
-
-    # If no tables found, try word-based reconstruction
-    if not tables:
-        logger.info("No note tables via extract_tables(), trying word-based reconstruction")
-        for page_idx in pages_to_try:
-            words = _extract_text_lines_with_positions(pdf_path, page_idx)
-            if words:
-                page_width = _get_page_width(pdf_path, page_idx)
-                reconstructed = _reconstruct_table_from_words(words, page_width)
-                if len(reconstructed) > 2:
-                    tables.append(reconstructed)
+    tables = _extract_markdown_tables(pdf_path, pages_to_try)
+    logger.info(f"pymupdf4llm found {len(tables)} tables on note pages {pages_to_try}")
 
     if not tables:
         return [], None
 
-    # Find the note table - look for one containing "other expenses" or the note number
+    # Find the note table
     note_table = None
     for table in tables:
         text = ' '.join(str(cell or '').lower() for row in table for cell in row)
@@ -438,7 +380,6 @@ def extract_note_from_tables(pdf_path: str, note_page: int,
             break
 
     if note_table is None:
-        # Use the largest table
         note_table = max(tables, key=len)
 
     # Identify columns
@@ -451,18 +392,17 @@ def extract_note_from_tables(pdf_path: str, note_page: int,
             continue
         label = str(row[label_col] or '').strip()
 
-        # Skip header rows, empty rows, and note headings
         if not label:
             continue
         label_lower = label.lower()
         if any(skip in label_lower for skip in [
             'for the year', 'march 31', 'particulars', 'in \u20b9',
-            'in rs', 'in inr', 'note', f'{note_number}.',
+            'in rs', 'in inr', f'{note_number}.',
         ]):
             continue
 
-        curr_val = _parse_number(row[curr_col]) if curr_col >= 0 and curr_col < len(row) else None
-        prev_val = _parse_number(row[prev_col]) if prev_col >= 0 and prev_col < len(row) else None
+        curr_val = _parse_number(row[curr_col]) if 0 <= curr_col < len(row) else None
+        prev_val = _parse_number(row[prev_col]) if 0 <= prev_col < len(row) else None
 
         if curr_val is not None:
             note_items.append({
@@ -471,7 +411,7 @@ def extract_note_from_tables(pdf_path: str, note_page: int,
                 'previous': prev_val if prev_val is not None else 0.0,
             })
 
-    # Identify total row (usually last row, or one labeled "Total")
+    # Identify total row
     total_item = None
     for item in reversed(note_items):
         if 'total' in item['label'].lower():
@@ -485,31 +425,33 @@ def extract_note_from_tables(pdf_path: str, note_page: int,
 
 
 # -------------------------------------------------------------------
-# Page identification (enhanced with pdfplumber)
+# Page identification
 # -------------------------------------------------------------------
 
 def find_standalone_pages(pdf_path: str) -> tuple[dict, int]:
     """
     Identify pages containing standalone financial statements.
-    Uses pdfplumber for text extraction (better layout preservation than PyMuPDF).
+    Uses pymupdf4llm for text extraction with better layout preservation.
     """
+    doc = fitz.open(pdf_path)
     pages = {}
-    with pdfplumber.open(pdf_path) as pdf:
-        total = len(pdf.pages)
-        for i, page in enumerate(pdf.pages):
-            text = page.extract_text() or ''
-            lower = text.lower()
+    total = doc.page_count
 
-            if 'statement of profit and loss' in lower and 'standalone' in lower:
-                if 'pnl' not in pages:
-                    pages['pnl'] = i
-            if 'balance sheet' in lower and 'standalone' in lower:
-                if 'bs' not in pages:
-                    pages['bs'] = i
-            if 'cash flow' in lower and 'standalone' in lower:
-                if 'cf' not in pages:
-                    pages['cf'] = i
+    for i in range(total):
+        text = doc[i].get_text()
+        lower = text.lower()
 
+        if 'statement of profit and loss' in lower and 'standalone' in lower:
+            if 'pnl' not in pages:
+                pages['pnl'] = i
+        if 'balance sheet' in lower and 'standalone' in lower:
+            if 'bs' not in pages:
+                pages['bs'] = i
+        if 'cash flow' in lower and 'standalone' in lower:
+            if 'cf' not in pages:
+                pages['cf'] = i
+
+    doc.close()
     return pages, total
 
 
@@ -517,29 +459,18 @@ def find_standalone_pages(pdf_path: str) -> tuple[dict, int]:
 # Helpers
 # -------------------------------------------------------------------
 
-def _get_page_count(pdf_path: str) -> int:
-    with pdfplumber.open(pdf_path) as pdf:
-        return len(pdf.pages)
-
-
-def _get_page_width(pdf_path: str, page_idx: int) -> float:
-    with pdfplumber.open(pdf_path) as pdf:
-        if page_idx < len(pdf.pages):
-            return pdf.pages[page_idx].width
-    return 612  # default letter width
-
-
 def _detect_company_name(pdf_path: str, page_idx: int) -> str:
     """Detect company name from the top of a page."""
-    with pdfplumber.open(pdf_path) as pdf:
-        if page_idx >= len(pdf.pages):
-            return 'Unknown Company'
-        text = pdf.pages[page_idx].extract_text() or ''
+    doc = fitz.open(pdf_path)
+    if page_idx >= doc.page_count:
+        doc.close()
+        return 'Unknown Company'
+    text = doc[page_idx].get_text()
+    doc.close()
 
     for line in text.split('\n')[:15]:
         line = line.strip()
         if 'Limited' in line or 'Ltd' in line:
-            # Clean up: remove page numbers, extra formatting
             name = line.split('\u2014')[0].split('\u2013')[0].strip()
             name = re.sub(r'\d+$', '', name).strip()
             if len(name) > 5:

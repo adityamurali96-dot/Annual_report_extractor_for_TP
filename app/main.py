@@ -96,7 +96,7 @@ def _run_extraction(pdf_path: str, job_id: str) -> dict:
     """
     Run the extraction pipeline.
     - Uses Claude API for optional page identification (TOC verification).
-    - Uses pdfplumber for structured table extraction (primary).
+    - Uses pymupdf4llm (Marker engine) for structured table extraction (primary).
     - Falls back to regex-based extraction if table extraction fails.
     """
     from app.excel_writer import create_excel
@@ -145,15 +145,15 @@ def _run_extraction(pdf_path: str, job_id: str) -> dict:
                         f"FY: {fy_current} / {fy_previous}")
         except Exception as e:
             logger.warning(f"[{job_id}] Claude page identification failed, "
-                           f"falling back to pdfplumber: {e}")
+                           f"falling back to pymupdf4llm: {e}")
 
-    # If Claude didn't find pages, try pdfplumber then regex
+    # If Claude didn't find pages, try pymupdf4llm then regex
     if "pnl" not in pages:
-        logger.info(f"[{job_id}] Using pdfplumber for page identification")
+        logger.info(f"[{job_id}] Using pymupdf4llm for page identification")
         try:
             pages, _ = find_standalone_pages_table(pdf_path)
         except Exception as e:
-            logger.warning(f"[{job_id}] pdfplumber page identification failed: {e}")
+            logger.warning(f"[{job_id}] pymupdf4llm page identification failed: {e}")
 
     if "pnl" not in pages:
         logger.info(f"[{job_id}] Falling back to regex page identification")
@@ -171,20 +171,20 @@ def _run_extraction(pdf_path: str, job_id: str) -> dict:
     pnl = None
     extraction_method = None
 
-    # Primary: pdfplumber structured table extraction
+    # Primary: pymupdf4llm structured table extraction
     try:
-        logger.info(f"[{job_id}] Extracting P&L from page {pages['pnl']} (pdfplumber tables)")
+        logger.info(f"[{job_id}] Extracting P&L from page {pages['pnl']} (pymupdf4llm tables)")
         pnl = extract_pnl_from_tables(pdf_path, pages["pnl"])
         item_count = len(pnl.get('items', {}))
-        logger.info(f"[{job_id}] pdfplumber P&L: {item_count} items extracted")
+        logger.info(f"[{job_id}] pymupdf4llm P&L: {item_count} items extracted")
         if item_count < 5:
-            logger.warning(f"[{job_id}] pdfplumber extracted only {item_count} items, "
+            logger.warning(f"[{job_id}] pymupdf4llm extracted only {item_count} items, "
                            f"falling back to regex")
             pnl = None
         else:
-            extraction_method = "pdfplumber"
+            extraction_method = "pymupdf4llm"
     except Exception as e:
-        logger.warning(f"[{job_id}] pdfplumber P&L extraction failed: {e}")
+        logger.warning(f"[{job_id}] pymupdf4llm P&L extraction failed: {e}")
 
     # Fallback: regex-based extraction
     if pnl is None:
@@ -216,19 +216,19 @@ def _run_extraction(pdf_path: str, job_id: str) -> dict:
             pdf_path, note_num, search_start, "Other expenses"
         )
         if note_page is not None:
-            # Primary: pdfplumber table extraction for notes
+            # Primary: pymupdf4llm table extraction for notes
             try:
                 logger.info(f"[{job_id}] Extracting Note {note_num} from page {note_page} "
-                            f"(pdfplumber tables)")
+                            f"(pymupdf4llm tables)")
                 note_items, note_total = extract_note_from_tables(
                     pdf_path, note_page, note_num
                 )
                 if not note_items:
                     raise ValueError("No note items extracted")
-                logger.info(f"[{job_id}] pdfplumber Note {note_num}: "
+                logger.info(f"[{job_id}] pymupdf4llm Note {note_num}: "
                             f"{len(note_items)} items extracted")
             except Exception as e:
-                logger.warning(f"[{job_id}] pdfplumber note extraction failed: {e}")
+                logger.warning(f"[{job_id}] pymupdf4llm note extraction failed: {e}")
                 # Fallback: regex-based note extraction
                 if note_line is not None:
                     logger.info(f"[{job_id}] Falling back to regex note extraction")
