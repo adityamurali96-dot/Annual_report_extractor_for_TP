@@ -1,6 +1,7 @@
 """
 Excel output generation with professional formatting.
-Creates a multi-sheet workbook with P&L, metrics, note breakup, and validation.
+Creates a multi-sheet workbook with P&L, metrics, note breakup, validation,
+and header validation for company verification.
 """
 
 from openpyxl import Workbook
@@ -24,6 +25,13 @@ ORANGE_FONT = Font(name='Arial', size=10, bold=True, color='BF6900')
 ORANGE_FILL = PatternFill('solid', fgColor='FFF2CC')
 LIGHT_BORDER = Border(bottom=Side(style='thin', color='D9D9D9'))
 TOTAL_BORDER = Border(top=Side(style='thin'), bottom=Side(style='double'))
+
+SECTION_LABELS = {
+    'pnl': 'Statement of Profit and Loss',
+    'bs': 'Balance Sheet',
+    'cf': 'Cash Flow Statement',
+    'notes_start': 'Notes to Financial Statements',
+}
 
 
 def _write_header_row(ws, row: int, headers: list[str], col_start: int = 1):
@@ -302,14 +310,55 @@ def _write_note_sheet(wb: Workbook, pnl: dict, note_items: list, note_total: dic
 # -------------------------------------------------------------------
 
 def _write_validation_sheet(wb: Workbook, pnl: dict, metrics: dict,
-                            note_total: dict | None, note_num: str | None):
+                            note_total: dict | None, note_num: str | None,
+                            page_headers: dict, pages: dict):
     ws = wb.create_sheet("Validation")
     _set_column_widths(ws, {'A': 55, 'B': 18, 'C': 18, 'D': 12})
 
     ws['A1'] = "Data Validation & Cross-Checks"
     ws['A1'].font = Font(name='Arial', bold=True, size=13, color='2F5496')
 
+    # --- Section 1: Header Validation (Company Verification) ---
     r = 3
+    ws.cell(row=r, column=1, value="STANDALONE PAGE HEADERS (verify correct company)")
+    for c in range(1, 5):
+        ws.cell(row=r, column=c).font = SECTION_FONT
+        ws.cell(row=r, column=c).fill = SECTION_FILL
+
+    r += 1
+    _write_header_row(ws, r, ['Section', 'PDF Page', 'Header Text', ''])
+
+    for section_key in ['pnl', 'bs', 'cf', 'notes_start']:
+        page_num = pages.get(section_key)
+        if page_num is None:
+            continue
+        r += 1
+        section_name = SECTION_LABELS.get(section_key, section_key)
+        header_text = page_headers.get(section_key, 'N/A')
+
+        ws.cell(row=r, column=1, value=section_name)
+        ws.cell(row=r, column=1).font = BOLD_FONT
+        ws.cell(row=r, column=2, value=f"Page {page_num + 1}")
+        ws.cell(row=r, column=2).font = NORMAL_FONT
+        ws.cell(row=r, column=2).alignment = Alignment(horizontal='center')
+
+        # Write header text across columns C-D merged
+        ws.merge_cells(start_row=r, start_column=3, end_row=r, end_column=4)
+        ws.cell(row=r, column=3, value=header_text)
+        ws.cell(row=r, column=3).font = Font(name='Arial', size=9, color='333333')
+        ws.cell(row=r, column=3).alignment = Alignment(wrap_text=True, vertical='top')
+
+        for c in range(1, 5):
+            ws.cell(row=r, column=c).border = LIGHT_BORDER
+
+    # --- Section 2: Numeric Cross-Checks ---
+    r += 2
+    ws.cell(row=r, column=1, value="NUMERIC CROSS-CHECKS")
+    for c in range(1, 5):
+        ws.cell(row=r, column=c).font = SECTION_FONT
+        ws.cell(row=r, column=c).fill = SECTION_FILL
+
+    r += 1
     _write_header_row(ws, r, ['Check', 'Computed', 'Reported', 'Status'])
 
     items = pnl.get('items', {})
@@ -358,8 +407,8 @@ def create_excel(data: dict, output_path: str) -> str:
     Create a formatted Excel workbook from extracted financial data.
 
     Args:
-        data: Dict with keys: pnl, metrics (optional), note_items, note_total, note_number,
-              fy_current, fy_previous, company, currency
+        data: Dict with keys: pnl, note_items, note_total, note_number,
+              fy_current, fy_previous, company, currency, pages, page_headers
         output_path: Path to save the Excel file
 
     Returns:
@@ -377,6 +426,8 @@ def create_excel(data: dict, output_path: str) -> str:
     note_items = data.get('note_items', [])
     note_total = data.get('note_total')
     note_num = data.get('note_number')
+    page_headers = data.get('page_headers', {})
+    pages = data.get('pages', {})
 
     # Ensure pnl has company/currency
     pnl['company'] = company
@@ -389,7 +440,7 @@ def create_excel(data: dict, output_path: str) -> str:
     _write_pnl_sheet(wb, pnl, fy_current, fy_previous)
     _write_metrics_sheet(wb, metrics, company, currency, fy_current, fy_previous)
     _write_note_sheet(wb, pnl, note_items, note_total, note_num, fy_current, fy_previous)
-    _write_validation_sheet(wb, pnl, metrics, note_total, note_num)
+    _write_validation_sheet(wb, pnl, metrics, note_total, note_num, page_headers, pages)
 
     wb.save(output_path)
     return output_path

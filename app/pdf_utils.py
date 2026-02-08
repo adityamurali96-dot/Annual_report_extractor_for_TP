@@ -72,3 +72,30 @@ def extract_pages_range(pdf_path: str, start: int, end: int) -> list[dict]:
         })
     doc.close()
     return pages
+
+
+def extract_page_headers(pdf_path: str, page_indices: dict[str, int],
+                         num_lines: int = 5) -> dict[str, str]:
+    """
+    Extract header text (first N lines) from specific PDF pages for validation.
+
+    Args:
+        pdf_path: Path to the PDF file
+        page_indices: Dict mapping section names to 0-indexed page numbers,
+                      e.g. {"pnl": 45, "bs": 42, "cf": 48}
+        num_lines: Number of lines to extract from top of each page
+
+    Returns:
+        Dict mapping section names to their header text,
+        e.g. {"pnl": "ABC Limited\nStandalone Statement of Profit and Loss\n..."}
+    """
+    doc = fitz.open(pdf_path)
+    headers = {}
+    for section, page_idx in page_indices.items():
+        if page_idx is None or page_idx < 0 or page_idx >= doc.page_count:
+            continue
+        text = doc[page_idx].get_text()
+        lines = [l.strip() for l in text.split('\n') if l.strip()][:num_lines]
+        headers[section] = '\n'.join(lines)
+    doc.close()
+    return headers
