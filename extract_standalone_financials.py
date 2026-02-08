@@ -106,9 +106,10 @@ def run_extraction(pdf_path: str, output_path: str):
     note_num = pnl["note_refs"].get("Other expenses")
     note_items = []
     note_total = None
+    search_start = pages.get("notes_start", pages["pnl"])
 
     if note_num:
-        search_start = pages.get("notes_start", pages["pnl"])
+        print(f"  Note reference for Other expenses: {note_num}")
         note_page, _ = find_note_page(pdf_path, note_num, search_start, "Other expenses")
 
         if note_page is not None:
@@ -128,7 +129,7 @@ def run_extraction(pdf_path: str, output_path: str):
         else:
             print(f"  Could not find Note {note_num} page")
     else:
-        print("  No note reference found for Other expenses")
+        print("  No note reference found for Other expenses in P&L table")
 
     # ==================================================================
     # STAGE 5: Compute metrics & generate Excel

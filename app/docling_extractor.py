@@ -97,6 +97,57 @@ def _is_note_ref(s: str) -> bool:
 
 
 # -------------------------------------------------------------------
+# Fallback: extract note reference from raw PDF text
+# -------------------------------------------------------------------
+
+def _extract_note_ref_from_text(pdf_path: str, pnl_page: int,
+                                 item_keyword: str = "other expenses") -> str | None:
+    """
+    Extract note reference for a P&L item using raw page text as fallback.
+
+    In annual reports, P&L rows are typically formatted as:
+        Label   NoteRef   CurrentYear   PreviousYear
+    e.g.:
+        Other expenses   27   1,234.56   987.65
+
+    This scans the P&L page text for lines containing the keyword and
+    extracts a standalone 1-2 digit note reference number.
+    """
+    doc = fitz.open(pdf_path)
+
+    for page_offset in range(2):
+        page_idx = pnl_page + page_offset
+        if page_idx >= doc.page_count:
+            break
+        text = doc[page_idx].get_text()
+        lines = text.split('\n')
+
+        for i, line in enumerate(lines):
+            line_lower = line.lower().strip()
+            if item_keyword not in line_lower:
+                continue
+
+            # Method 1: note ref embedded in the same line after the keyword
+            # e.g. "Other expenses  27  1,234  987"
+            parts = re.split(r'\s{2,}', line.strip())
+            for part in parts:
+                part = part.strip()
+                if re.match(r'^\d{1,2}$', part) and 1 <= int(part) <= 60:
+                    doc.close()
+                    return part
+
+            # Method 2: note ref is on the immediately following line(s)
+            for j in range(i + 1, min(i + 3, len(lines))):
+                next_line = lines[j].strip()
+                if re.match(r'^\d{1,2}$', next_line) and 1 <= int(next_line) <= 60:
+                    doc.close()
+                    return next_line
+
+    doc.close()
+    return None
+
+
+# -------------------------------------------------------------------
 # P&L line item patterns
 # -------------------------------------------------------------------
 
@@ -316,6 +367,14 @@ def extract_pnl_docling(pdf_path: str, pnl_page: int) -> dict:
 
         logger.info(f"Docling extracted {len(extracted)} P&L items: {list(extracted.keys())}")
 
+        # Fallback: extract note reference from raw text if Docling missed it
+        if 'Other expenses' in extracted and 'Other expenses' not in note_refs:
+            text_note_ref = _extract_note_ref_from_text(pdf_path, pnl_page)
+            if text_note_ref:
+                note_refs['Other expenses'] = text_note_ref
+                logger.info(f"Note ref for 'Other expenses' found via text fallback: "
+                            f"{text_note_ref}")
+
     finally:
         os.unlink(temp_pdf)
 
@@ -330,13 +389,203 @@ def extract_pnl_docling(pdf_path: str, pnl_page: int) -> dict:
 
 
 # -------------------------------------------------------------------
+# Note table selection (scoring-based)
+# -------------------------------------------------------------------
+
+# Common expense line-item keywords found in "Other expenses" notes
+_NOTE_EXPENSE_KEYWORDS = [
+    'travelling', 'conveyance', 'communication', 'rent', 'lease',
+    'insurance', 'professional', 'legal', 'repairs', 'maintenance',
+    'power', 'fuel', 'electricity', 'printing', 'stationery',
+    'advertisement', 'publicity', 'corporate social', 'csr',
+    'miscellaneous', 'rates and taxes', 'outsourced', 'manpower',
+    'recruitment', 'training', 'subscription', 'membership',
+    'bank charges', 'office', 'software', 'license', 'audit',
+    'donation', 'bad debts', 'provision', 'loss on',
+]
+
+
+def _find_best_note_table(tables, note_number: str):
+    """
+    Score and pick the table most likely to be the "Other expenses" note.
+    Returns (best_table, index) or (None, -1).
+    """
+    note_esc = re.escape(note_number)
+    best_table = None
+    best_score = -1
+    best_idx = -1
+
+    for i, df in enumerate(tables):
+        if len(df) < 2:
+            continue
+
+        text = ' '.join(
+            str(v).lower() for v in df.values.flatten() if v is not None
+        )
+        score = 0
+
+        # Strong signal: note number heading (e.g. "27." or "note 27")
+        if re.search(rf'\b{note_esc}\s*[.\-–—:)]', text):
+            score += 4
+        # Strong signal: "other expenses" in table
+        if 'other expenses' in text:
+            score += 4
+        # Moderate signal: common expense keywords
+        expense_hits = sum(1 for kw in _NOTE_EXPENSE_KEYWORDS if kw in text)
+        score += min(expense_hits, 6)
+        # Prefer tables with a reasonable number of rows (5-40)
+        if 5 <= len(df) <= 40:
+            score += 1
+        # Weak signal: "total" present (notes usually have a total row)
+        if 'total' in text:
+            score += 1
+
+        if score > best_score:
+            best_score = score
+            best_table = df
+            best_idx = i
+
+    return (best_table, best_idx) if best_score >= 3 else (None, -1)
+
+
+# -------------------------------------------------------------------
+# Fallback: text-based note extraction
+# -------------------------------------------------------------------
+
+def _extract_note_from_text(pdf_path: str, note_page: int,
+                             note_number: str,
+                             max_pages: int = 3) -> tuple[list[dict], dict | None]:
+    """
+    Extract note line items from raw PDF text.
+
+    Used as a fallback when Docling table extraction yields no usable data.
+    Reads up to *max_pages* starting from *note_page*, locates the note
+    heading, skips header/unit rows, and parses label + value pairs until
+    the next note heading or a clear section boundary.
+    """
+    doc = fitz.open(pdf_path)
+    all_lines: list[str] = []
+
+    for offset in range(max_pages):
+        page_idx = note_page + offset
+        if page_idx >= doc.page_count:
+            break
+        text = doc[page_idx].get_text()
+        all_lines.extend(text.split('\n'))
+    doc.close()
+
+    note_esc = re.escape(note_number)
+    heading_re = re.compile(rf'^\s*{note_esc}\s*[.\-–—:)]\s', re.IGNORECASE)
+
+    # 1. Locate note heading
+    note_start = None
+    for idx, line in enumerate(all_lines):
+        if heading_re.match(line.strip()):
+            note_start = idx
+            break
+    if note_start is None:
+        return [], None
+
+    # 2. Skip header / unit rows
+    skip_kw = [
+        'for the year', 'march 31', 'march 31,', 'particulars',
+        '\u20b9', 'in rs', 'in inr', 'in million', 'in lakhs',
+        'in crore', 'in thousands', '(audited)', '(unaudited)',
+    ]
+    i = note_start + 1
+    while i < len(all_lines):
+        stripped = all_lines[i].strip().lower()
+        if not stripped or any(s in stripped for s in skip_kw):
+            i += 1
+        else:
+            break
+
+    # 3. Parse items until next note heading or section boundary
+    next_note_re = re.compile(r'^\s*(\d{1,2})\s*[.\-–—:)]\s+[A-Za-z]')
+    note_items: list[dict] = []
+    current_label: str | None = None
+
+    while i < len(all_lines):
+        line = all_lines[i].strip()
+        i += 1
+
+        if not line:
+            continue
+
+        # Stop at next note heading
+        m = next_note_re.match(line)
+        if m and m.group(1) != note_number:
+            break
+        # Stop at footnotes / signatures
+        if line.startswith('*') and len(line) > 5 and any(c.isalpha() for c in line):
+            break
+
+        # Try to split a single line into label + values
+        # e.g. "Travelling and conveyance  123.45  98.76"
+        parts = re.split(r'\s{2,}', line)
+        if len(parts) >= 3:
+            maybe_label = parts[0]
+            maybe_vals = [_parse_number(p) for p in parts[1:]]
+            nums = [v for v in maybe_vals if v is not None]
+            if len(nums) >= 2 and any(c.isalpha() for c in maybe_label):
+                note_items.append({
+                    'label': maybe_label.strip(),
+                    'current': nums[0],
+                    'previous': nums[1],
+                })
+                current_label = None
+                continue
+
+        # Pure numeric line → attach to current label
+        val = _parse_number(line)
+        if val is not None and not any(c.isalpha() for c in line):
+            if current_label is not None:
+                existing = next(
+                    (x for x in note_items if x['label'] == current_label), None
+                )
+                if existing is None:
+                    note_items.append({
+                        'label': current_label,
+                        'current': val,
+                        'previous': None,
+                    })
+                elif existing.get('previous') is None:
+                    existing['previous'] = val
+                    current_label = None
+            continue
+
+        # Otherwise it's a label line
+        if any(c.isalpha() for c in line):
+            # Skip if it looks like a sub-heading that repeats the note number
+            if re.match(rf'^\s*{note_esc}\s*[.\-–—:)]', line, re.IGNORECASE):
+                continue
+            current_label = line
+
+    # Ensure every item has a 'previous' value
+    for item in note_items:
+        if item.get('previous') is None:
+            item['previous'] = 0.0
+
+    # Identify total
+    total_item = None
+    for item in reversed(note_items):
+        if 'total' in item['label'].lower():
+            total_item = item
+            break
+    if total_item is None and note_items:
+        total_item = note_items[-1]
+
+    return note_items, total_item
+
+
+# -------------------------------------------------------------------
 # Public API: Note breakup extraction
 # -------------------------------------------------------------------
 
 def extract_note_docling(pdf_path: str, note_page: int,
                           note_number: str) -> tuple[list[dict], dict | None]:
     """
-    Extract note breakup using Docling.
+    Extract note breakup using Docling, with text-based fallback.
 
     Args:
         pdf_path: Path to PDF
@@ -350,9 +599,11 @@ def extract_note_docling(pdf_path: str, note_page: int,
     total_pages = doc.page_count
     doc.close()
 
+    # Try up to 3 pages (notes can span across pages)
     target_pages = [note_page]
-    if note_page + 1 < total_pages:
-        target_pages.append(note_page + 1)
+    for p in (note_page + 1, note_page + 2):
+        if p < total_pages:
+            target_pages.append(p)
 
     logger.info(f"Docling: extracting note tables from pages {target_pages}")
 
@@ -372,23 +623,25 @@ def extract_note_docling(pdf_path: str, note_page: int,
                 logger.warning(f"Failed to export note table: {e}")
 
         if not tables:
-            return [], None
+            logger.warning("Docling found no tables on note pages, "
+                           "falling back to text extraction")
+            return _extract_note_from_text(pdf_path, note_page, note_number)
 
-        # Find the note table (look for "other expenses" or the note number)
-        note_table = None
-        for df in tables:
-            text = ' '.join(str(v).lower() for v in df.values.flatten() if v is not None)
-            if 'other expenses' in text or f'{note_number}.' in text or 'expense' in text:
-                note_table = df
-                break
-
+        # Use scoring to pick the best "Other expenses" note table
+        note_table, idx = _find_best_note_table(tables, note_number)
         if note_table is None:
             note_table = max(tables, key=len)
+            logger.warning("Could not identify note table by scoring, "
+                           "using largest table")
+
+        logger.info(f"Note table: {len(note_table)} rows x "
+                     f"{len(note_table.columns)} cols (table idx={idx})")
 
         # Identify columns
         label_col, curr_col, prev_col = _identify_value_columns_df(note_table)
 
         # Extract items
+        note_esc = re.escape(note_number)
         note_items = []
         for _, row in note_table.iterrows():
             ncols = len(row)
@@ -400,8 +653,14 @@ def extract_note_docling(pdf_path: str, note_page: int,
             label_lower = label.lower()
             if any(skip in label_lower for skip in [
                 'for the year', 'march 31', 'particulars', 'in \u20b9',
-                'in rs', 'in inr', f'{note_number}.',
+                'in rs', 'in inr', 'in million', 'in lakhs', 'in crore',
             ]):
+                continue
+            # Skip the note heading row itself (e.g. "27. Other expenses")
+            if re.match(rf'^\s*{note_esc}\s*[.\-–—:)]', label, re.IGNORECASE):
+                continue
+            # Skip rows that are just the keyword header
+            if label_lower in ('other expenses', 'other expense'):
                 continue
 
             curr_val = _parse_number(row.iloc[curr_col]) if 0 <= curr_col < ncols else None
@@ -424,6 +683,18 @@ def extract_note_docling(pdf_path: str, note_page: int,
             total_item = note_items[-1]
 
         logger.info(f"Docling extracted {len(note_items)} note items")
+
+        # If Docling extracted very few items, try text fallback as supplement
+        if len(note_items) < 3:
+            logger.info("Docling extracted few note items, trying text fallback")
+            text_items, text_total = _extract_note_from_text(
+                pdf_path, note_page, note_number
+            )
+            if len(text_items) > len(note_items):
+                logger.info(f"Text fallback found {len(text_items)} items "
+                            f"(vs Docling {len(note_items)}), using text result")
+                return text_items, text_total
+
         return note_items, total_item
 
     finally:
