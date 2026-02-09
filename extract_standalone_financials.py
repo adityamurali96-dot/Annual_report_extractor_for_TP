@@ -17,9 +17,20 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from app.config import ANTHROPIC_API_KEY
 from app.docling_extractor import extract_note_docling, extract_pnl_docling
 from app.excel_writer import create_excel
-from app.extractor import compute_metrics, find_note_page, validate_note_extraction
+from app.extractor import (
+    compute_metrics,
+    find_all_standalone_candidates,
+    find_note_page,
+    validate_note_extraction,
+)
 from app.extractor import find_standalone_pages as find_standalone_pages_regex
 from app.pdf_utils import extract_page_headers
+
+SECTION_LABELS = {
+    "pnl": "Statement of Profit & Loss",
+    "bs": "Balance Sheet",
+    "cf": "Cash Flow Statement",
+}
 
 
 def run_extraction(pdf_path: str, output_path: str):
@@ -72,6 +83,68 @@ def run_extraction(pdf_path: str, output_path: str):
         sys.exit(1)
 
     print(f"  Standalone pages: {pages}")
+
+    # ==================================================================
+    # STAGE 1b: Check for multiple standalone candidates & confirm
+    # ==================================================================
+    candidates = find_all_standalone_candidates(pdf_path)
+    has_multiple = any(len(v) > 1 for v in candidates.values())
+
+    # Ensure recommended pages are in the candidate lists
+    for section in ["pnl", "bs", "cf"]:
+        if section in pages and pages[section] not in candidates.get(section, []):
+            candidates.setdefault(section, []).insert(0, pages[section])
+
+    if has_multiple:
+        print("\n  ** Multiple standalone financial pages detected **")
+        print("  Please confirm the correct page for each section.\n")
+
+        # Show candidates with headers for each section
+        candidate_page_map = {}
+        for section, page_list in candidates.items():
+            for pg in page_list:
+                candidate_page_map[f"{section}_p{pg}"] = pg
+        candidate_headers = extract_page_headers(pdf_path, candidate_page_map, num_lines=5)
+
+        for section in ["pnl", "bs", "cf"]:
+            page_list = candidates.get(section, [])
+            if not page_list:
+                continue
+
+            label = SECTION_LABELS.get(section, section)
+            recommended = pages.get(section)
+
+            print(f"  --- {label} ---")
+            for idx, pg in enumerate(page_list):
+                rec_tag = " [RECOMMENDED]" if pg == recommended else ""
+                header = candidate_headers.get(f"{section}_p{pg}", "(no header text)")
+                header_preview = header.replace('\n', ' | ')[:100]
+                print(f"    [{idx + 1}] PDF Page {pg + 1}{rec_tag}")
+                print(f"        Header: {header_preview}")
+            print()
+
+            if len(page_list) > 1:
+                while True:
+                    default_idx = page_list.index(recommended) + 1 if recommended in page_list else 1
+                    choice = input(f"  Select {label} page [1-{len(page_list)}] "
+                                   f"(default={default_idx}): ").strip()
+                    if choice == "":
+                        chosen_idx = default_idx - 1
+                        break
+                    try:
+                        chosen_idx = int(choice) - 1
+                        if 0 <= chosen_idx < len(page_list):
+                            break
+                        print(f"    Invalid choice. Enter 1-{len(page_list)}.")
+                    except ValueError:
+                        print(f"    Invalid input. Enter a number 1-{len(page_list)}.")
+
+                pages[section] = page_list[chosen_idx]
+                print(f"  -> Selected PDF Page {pages[section] + 1}\n")
+
+        print(f"  Confirmed pages: {pages}")
+    else:
+        print("  Single candidate per section - no confirmation needed.")
 
     # ==================================================================
     # STAGE 2: Extract page headers for validation
