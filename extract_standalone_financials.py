@@ -8,18 +8,18 @@ Pipeline:
   4. Write to Excel
 """
 
-import sys
 import os
+import sys
 
 # Add parent directory to path so we can import app modules
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from app.config import ANTHROPIC_API_KEY
-from app.pdf_utils import extract_page_headers
-from app.docling_extractor import extract_pnl_docling, extract_note_docling
-from app.extractor import find_standalone_pages as find_standalone_pages_regex
-from app.extractor import find_note_page, compute_metrics, validate_note_extraction
+from app.docling_extractor import extract_note_docling, extract_pnl_docling
 from app.excel_writer import create_excel
+from app.extractor import compute_metrics, find_note_page, validate_note_extraction
+from app.extractor import find_standalone_pages as find_standalone_pages_regex
+from app.pdf_utils import extract_page_headers
 
 
 def run_extraction(pdf_path: str, output_path: str):

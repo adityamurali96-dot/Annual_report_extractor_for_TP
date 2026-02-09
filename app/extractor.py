@@ -4,10 +4,10 @@ Used as a fallback and for validation alongside Claude API extraction.
 """
 
 import re
+
 import fitz
 
-from app.pdf_utils import parse_number, is_note_ref, is_value_line
-
+from app.pdf_utils import is_note_ref, is_value_line, parse_number
 
 # -------------------------------------------------------------------
 # Stage 1: Find standalone financial statement pages
@@ -21,17 +21,14 @@ def find_standalone_pages(pdf_path: str) -> tuple[dict, int]:
         text = doc[i].get_text()
         lower = text.lower()
         # P&L
-        if 'statement of profit and loss' in lower and 'standalone' in lower:
-            if 'pnl' not in pages:
-                pages['pnl'] = i
+        if 'statement of profit and loss' in lower and 'standalone' in lower and 'pnl' not in pages:
+            pages['pnl'] = i
         # Balance Sheet
-        if 'balance sheet' in lower and 'standalone' in lower:
-            if 'bs' not in pages:
-                pages['bs'] = i
+        if 'balance sheet' in lower and 'standalone' in lower and 'bs' not in pages:
+            pages['bs'] = i
         # Cash Flow
-        if 'cash flow' in lower and 'standalone' in lower:
-            if 'cf' not in pages:
-                pages['cf'] = i
+        if 'cash flow' in lower and 'standalone' in lower and 'cf' not in pages:
+            pages['cf'] = i
     total = doc.page_count
     doc.close()
     return pages, total

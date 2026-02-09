@@ -9,16 +9,16 @@ Pipeline (PDF-only):
   5. Write to Excel with header validation
 """
 
-import uuid
 import logging
+import uuid
 from pathlib import Path
 
-from fastapi import FastAPI, UploadFile, File, HTTPException, Request
+from fastapi import FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
-from app.config import UPLOAD_DIR, ANTHROPIC_API_KEY, MAX_UPLOAD_SIZE_MB
+from app.config import ANTHROPIC_API_KEY, MAX_UPLOAD_SIZE_MB, UPLOAD_DIR
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
@@ -86,7 +86,7 @@ async def extract(file: UploadFile = File(...)):
         )
     except Exception as e:
         logger.exception(f"[{job_id}] Extraction failed")
-        raise HTTPException(500, f"Extraction failed: {str(e)}")
+        raise HTTPException(500, f"Extraction failed: {str(e)}") from e
     finally:
         if pdf_path.exists():
             pdf_path.unlink()
@@ -101,10 +101,10 @@ def _run_extraction(pdf_path: str, job_id: str) -> dict:
       4. Docling extracts note breakup from standalone notes only
       5. Generate Excel
     """
+    from app.docling_extractor import extract_note_docling, extract_pnl_docling
     from app.excel_writer import create_excel
-    from app.pdf_utils import extract_page_headers
-    from app.docling_extractor import extract_pnl_docling, extract_note_docling
     from app.extractor import find_note_page, validate_note_extraction
+    from app.pdf_utils import extract_page_headers
 
     excel_path = str(UPLOAD_DIR / f"{job_id}_output.xlsx")
 
@@ -240,5 +240,6 @@ def _run_extraction(pdf_path: str, job_id: str) -> dict:
 
 if __name__ == "__main__":
     import uvicorn
+
     from app.config import HOST, PORT
     uvicorn.run(app, host=HOST, port=PORT)

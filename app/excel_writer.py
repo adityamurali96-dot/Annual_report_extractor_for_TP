@@ -5,8 +5,7 @@ and header validation for company verification.
 """
 
 from openpyxl import Workbook
-from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
-
+from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 
 # -------------------------------------------------------------------
 # Shared styles
