@@ -34,6 +34,43 @@ def find_standalone_pages(pdf_path: str) -> tuple[dict, int]:
     return pages, total
 
 
+def find_all_standalone_candidates(pdf_path: str) -> dict[str, list[int]]:
+    """
+    Scan ALL pages for potential standalone financial statement matches.
+
+    Unlike find_standalone_pages() which returns only the first match per
+    section, this returns ALL candidate page numbers so the user can confirm
+    when there is ambiguity (e.g. pages without headings or multiple matches).
+
+    Returns:
+        Dict mapping section keys to lists of 0-indexed page numbers:
+        {"pnl": [45, 102], "bs": [43, 100], "cf": [48, 105]}
+    """
+    doc = fitz.open(pdf_path)
+    candidates: dict[str, list[int]] = {"pnl": [], "bs": [], "cf": []}
+
+    for i in range(doc.page_count):
+        text = doc[i].get_text()
+        lower = text.lower()
+
+        is_standalone = 'standalone' in lower
+
+        # P&L candidates
+        if 'statement of profit and loss' in lower and is_standalone:
+            candidates['pnl'].append(i)
+
+        # Balance Sheet candidates
+        if 'balance sheet' in lower and is_standalone:
+            candidates['bs'].append(i)
+
+        # Cash Flow candidates
+        if ('cash flow' in lower or 'cashflow' in lower) and is_standalone:
+            candidates['cf'].append(i)
+
+    doc.close()
+    return candidates
+
+
 # -------------------------------------------------------------------
 # Stage 2A: P&L Extraction (regex-based)
 # -------------------------------------------------------------------
