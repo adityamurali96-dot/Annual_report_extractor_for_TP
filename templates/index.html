@@ -24,16 +24,12 @@
                             <polyline points="9 15 12 12 15 15"/>
                         </svg>
                     </div>
-                    <p class="upload-text">Drop your annual report PDF here</p>
-                    <p class="upload-hint">or click to browse</p>
-                    <input type="file" id="fileInput" accept=".pdf" hidden>
+                    <p class="upload-text">Drop your annual report PDF(s) here</p>
+                    <p class="upload-hint">or click to browse (up to 2 files)</p>
+                    <input type="file" id="fileInput" accept=".pdf" multiple hidden>
                 </div>
 
-                <div class="file-info" id="fileInfo" style="display:none;">
-                    <span class="file-name" id="fileName"></span>
-                    <span class="file-size" id="fileSize"></span>
-                    <button class="btn-clear" id="clearBtn" title="Remove file">&times;</button>
-                </div>
+                <div class="file-list" id="fileList" style="display:none;"></div>
 
                 <button class="btn-extract" id="extractBtn" disabled>
                     <span class="btn-text">Extract Financials</span>
@@ -56,13 +52,19 @@
                 {% endif %}
             </div>
 
-            <!-- Confirmation dialog for multiple standalone candidates -->
+            <!-- Confirmation dialog for low-confidence P&L page -->
             <div class="confirm-section" id="confirmSection" style="display:none;">
                 <div class="confirm-card">
-                    <h2 class="confirm-title">Confirm Standalone Financial Pages</h2>
-                    <p class="confirm-desc">Multiple pages with standalone financials were detected. Please confirm the correct page for each section before extraction.</p>
+                    <div class="confirm-header-row">
+                        <h2 class="confirm-title">Confirm Standalone P&L Page</h2>
+                        <span class="confirm-confidence" id="confirmConfidence"></span>
+                    </div>
+                    <p class="confirm-desc" id="confirmDesc"></p>
 
-                    <div id="confirmSections"></div>
+                    <div class="confirm-group" id="confirmPnlGroup">
+                        <h3 class="confirm-group-title">Statement of Profit & Loss</h3>
+                        <div id="confirmPnlOptions"></div>
+                    </div>
 
                     <div class="confirm-actions">
                         <button class="btn-secondary" id="confirmCancelBtn">Cancel</button>
@@ -74,6 +76,9 @@
             <div class="processing-section" id="processingSection" style="display:none;">
                 <div class="spinner"></div>
                 <p class="processing-text" id="processingText">Uploading PDF...</p>
+                <div class="queue-status" id="queueStatus" style="display:none;">
+                    <span id="queueLabel"></span>
+                </div>
                 <div class="progress-steps">
                     <div class="step active" id="step1">
                         <div class="step-dot"></div>
@@ -81,19 +86,15 @@
                     </div>
                     <div class="step" id="step2">
                         <div class="step-dot"></div>
-                        <span>Identify Sections</span>
+                        <span>Identify</span>
                     </div>
                     <div class="step" id="step3">
                         <div class="step-dot"></div>
-                        <span>Confirm Pages</span>
+                        <span>Extract</span>
                     </div>
                     <div class="step" id="step4">
                         <div class="step-dot"></div>
-                        <span>Extract Data</span>
-                    </div>
-                    <div class="step" id="step5">
-                        <div class="step-dot"></div>
-                        <span>Generate Excel</span>
+                        <span>Excel</span>
                     </div>
                 </div>
             </div>
@@ -113,30 +114,28 @@
     <script>
         const dropZone = document.getElementById('dropZone');
         const fileInput = document.getElementById('fileInput');
-        const fileInfo = document.getElementById('fileInfo');
-        const fileName = document.getElementById('fileName');
-        const fileSize = document.getElementById('fileSize');
-        const clearBtn = document.getElementById('clearBtn');
+        const fileList = document.getElementById('fileList');
         const extractBtn = document.getElementById('extractBtn');
         const uploadSection = document.getElementById('uploadSection');
         const confirmSection = document.getElementById('confirmSection');
-        const confirmSections = document.getElementById('confirmSections');
+        const confirmConfidence = document.getElementById('confirmConfidence');
+        const confirmDesc = document.getElementById('confirmDesc');
+        const confirmPnlOptions = document.getElementById('confirmPnlOptions');
         const confirmCancelBtn = document.getElementById('confirmCancelBtn');
         const confirmExtractBtn = document.getElementById('confirmExtractBtn');
         const processingSection = document.getElementById('processingSection');
         const processingText = document.getElementById('processingText');
+        const queueStatus = document.getElementById('queueStatus');
+        const queueLabel = document.getElementById('queueLabel');
         const errorSection = document.getElementById('errorSection');
         const errorText = document.getElementById('errorText');
         const retryBtn = document.getElementById('retryBtn');
 
-        let selectedFile = null;
-        let identifyResult = null; // Stores /identify response
-
-        const SECTION_LABELS = {
-            'pnl': 'Statement of Profit & Loss',
-            'bs': 'Balance Sheet',
-            'cf': 'Cash Flow Statement',
-        };
+        let selectedFiles = [];
+        // Array of identify results (one per file) from /identify
+        let identifyResults = [];
+        // Index into identifyResults for the report currently being processed
+        let currentReportIdx = 0;
 
         // Drag & drop
         dropZone.addEventListener('click', () => fileInput.click());
@@ -148,33 +147,61 @@
         dropZone.addEventListener('drop', (e) => {
             e.preventDefault();
             dropZone.classList.remove('dragover');
-            if (e.dataTransfer.files.length) handleFile(e.dataTransfer.files[0]);
+            if (e.dataTransfer.files.length) handleFiles(Array.from(e.dataTransfer.files));
         });
 
         fileInput.addEventListener('change', () => {
-            if (fileInput.files.length) handleFile(fileInput.files[0]);
+            if (fileInput.files.length) handleFiles(Array.from(fileInput.files));
         });
 
-        clearBtn.addEventListener('click', () => {
-            selectedFile = null;
-            identifyResult = null;
-            fileInput.value = '';
-            fileInfo.style.display = 'none';
-            extractBtn.disabled = true;
-            dropZone.style.display = '';
-        });
-
-        function handleFile(file) {
-            if (!file.name.toLowerCase().endsWith('.pdf')) {
-                showError('Please select a PDF file');
+        function handleFiles(files) {
+            const pdfs = files.filter(f => f.name.toLowerCase().endsWith('.pdf')).slice(0, 2);
+            if (pdfs.length === 0) {
+                showError('Please select PDF file(s)');
                 return;
             }
-            selectedFile = file;
-            fileName.textContent = file.name;
-            fileSize.textContent = formatSize(file.size);
-            fileInfo.style.display = 'flex';
+            selectedFiles = pdfs;
+            renderFileList();
             dropZone.style.display = 'none';
             extractBtn.disabled = false;
+        }
+
+        function renderFileList() {
+            fileList.innerHTML = '';
+            fileList.style.display = 'block';
+            selectedFiles.forEach((file, idx) => {
+                const row = document.createElement('div');
+                row.className = 'file-info';
+                row.innerHTML = `
+                    <span class="file-name">${file.name}</span>
+                    <span class="file-size">${formatSize(file.size)}</span>
+                    <button class="btn-clear" title="Remove file" data-idx="${idx}">&times;</button>
+                `;
+                fileList.appendChild(row);
+            });
+            // Bind remove buttons
+            fileList.querySelectorAll('.btn-clear').forEach(btn => {
+                btn.addEventListener('click', (e) => {
+                    const idx = parseInt(e.target.dataset.idx);
+                    selectedFiles.splice(idx, 1);
+                    if (selectedFiles.length === 0) {
+                        resetUpload();
+                    } else {
+                        renderFileList();
+                    }
+                });
+            });
+        }
+
+        function resetUpload() {
+            selectedFiles = [];
+            identifyResults = [];
+            currentReportIdx = 0;
+            fileInput.value = '';
+            fileList.style.display = 'none';
+            fileList.innerHTML = '';
+            extractBtn.disabled = true;
+            dropZone.style.display = '';
         }
 
         function formatSize(bytes) {
@@ -183,22 +210,22 @@
             return (bytes / 1048576).toFixed(1) + ' MB';
         }
 
-        // ---- Step 1: Upload & Identify ----
+        // ---- Main flow: Upload & Identify all files, then process queue ----
         extractBtn.addEventListener('click', async () => {
-            if (!selectedFile) return;
+            if (selectedFiles.length === 0) return;
 
             uploadSection.style.display = 'none';
             errorSection.style.display = 'none';
             processingSection.style.display = 'flex';
             updateStep(1);
-            processingText.textContent = 'Uploading PDF...';
+            processingText.textContent = 'Uploading PDF' + (selectedFiles.length > 1 ? 's' : '') + '...';
 
             const formData = new FormData();
-            formData.append('file', selectedFile);
+            selectedFiles.forEach(f => formData.append('files', f));
 
             try {
                 updateStep(2);
-                processingText.textContent = 'Identifying standalone financial sections...';
+                processingText.textContent = 'Identifying standalone P&L sections...';
 
                 const response = await fetch('/identify', {
                     method: 'POST',
@@ -210,20 +237,11 @@
                     throw new Error(err.detail || 'Page identification failed');
                 }
 
-                identifyResult = await response.json();
+                identifyResults = await response.json();
+                currentReportIdx = 0;
 
-                if (identifyResult.needs_confirmation) {
-                    // Multiple candidates detected - show confirmation dialog
-                    updateStep(3);
-                    processingText.textContent = 'Multiple candidates found - confirmation needed';
-                    processingSection.style.display = 'none';
-                    showConfirmation(identifyResult);
-                } else {
-                    // Single candidate per section - proceed directly
-                    updateStep(3);
-                    processingText.textContent = 'Pages confirmed, extracting data...';
-                    await runExtraction(identifyResult.recommended_pages);
-                }
+                // Process the queue one report at a time
+                await processNextReport();
 
             } catch (err) {
                 processingSection.style.display = 'none';
@@ -231,69 +249,82 @@
             }
         });
 
-        // ---- Confirmation Dialog ----
-        function showConfirmation(result) {
-            confirmSections.innerHTML = '';
+        async function processNextReport() {
+            if (currentReportIdx >= identifyResults.length) {
+                // All done
+                setTimeout(() => {
+                    processingSection.style.display = 'none';
+                    uploadSection.style.display = 'block';
+                    resetUpload();
+                }, 2000);
+                return;
+            }
 
-            const candidates = result.candidates;
-            const headers = result.candidate_headers;
-            const recommended = result.recommended_pages;
+            const result = identifyResults[currentReportIdx];
+            const total = identifyResults.length;
 
-            for (const [section, pageList] of Object.entries(candidates)) {
-                if (pageList.length === 0) continue;
+            if (total > 1) {
+                queueStatus.style.display = 'block';
+                queueLabel.textContent = `Report ${currentReportIdx + 1} of ${total}: ${result.original_filename}`;
+            }
 
-                const label = SECTION_LABELS[section] || section;
-                const sectionDiv = document.createElement('div');
-                sectionDiv.className = 'confirm-group';
+            if (result.needs_confirmation) {
+                // Show P&L confirmation dialog
+                processingSection.style.display = 'none';
+                showPnlConfirmation(result);
+            } else {
+                // Auto-proceed with recommended pages
+                await runExtraction(result, result.recommended_pages);
+            }
+        }
 
-                const title = document.createElement('h3');
-                title.className = 'confirm-group-title';
-                title.textContent = label;
-                if (pageList.length > 1) {
-                    const badge = document.createElement('span');
-                    badge.className = 'confirm-badge';
-                    badge.textContent = pageList.length + ' candidates';
-                    title.appendChild(badge);
+        // ---- P&L Confirmation Dialog ----
+        function showPnlConfirmation(result) {
+            confirmPnlOptions.innerHTML = '';
+
+            const pct = Math.round(result.confidence * 100);
+            confirmConfidence.textContent = pct + '% confidence';
+            confirmConfidence.className = 'confirm-confidence' + (pct < 50 ? ' low' : ' medium');
+
+            const fname = result.original_filename || 'this report';
+            confirmDesc.textContent = `Multiple standalone P&L pages detected in "${fname}". ` +
+                'Please select the correct page before extraction. Page headers are shown to help identify the right one.';
+
+            const recommended = result.recommended_pages.pnl;
+
+            for (const pageNum of result.pnl_candidates) {
+                const isRecommended = (pageNum === recommended);
+                const optionDiv = document.createElement('label');
+                optionDiv.className = 'confirm-option' + (isRecommended ? ' recommended' : '');
+
+                const radio = document.createElement('input');
+                radio.type = 'radio';
+                radio.name = 'pnl_page';
+                radio.value = pageNum;
+                if (isRecommended) radio.checked = true;
+
+                const details = document.createElement('div');
+                details.className = 'confirm-option-details';
+
+                const pageLabelEl = document.createElement('div');
+                pageLabelEl.className = 'confirm-option-page';
+                pageLabelEl.textContent = 'PDF Page ' + (pageNum + 1);
+                if (isRecommended) {
+                    const recTag = document.createElement('span');
+                    recTag.className = 'confirm-recommended-tag';
+                    recTag.textContent = 'Recommended';
+                    pageLabelEl.appendChild(recTag);
                 }
-                sectionDiv.appendChild(title);
 
-                for (const pageNum of pageList) {
-                    const isRecommended = recommended[section] === pageNum;
-                    const optionDiv = document.createElement('label');
-                    optionDiv.className = 'confirm-option' + (isRecommended ? ' recommended' : '');
+                const headerText = document.createElement('pre');
+                headerText.className = 'confirm-option-header';
+                headerText.textContent = result.pnl_candidate_headers[String(pageNum)] || '(no header text)';
 
-                    const radio = document.createElement('input');
-                    radio.type = 'radio';
-                    radio.name = 'page_' + section;
-                    radio.value = pageNum;
-                    if (isRecommended) radio.checked = true;
-
-                    const details = document.createElement('div');
-                    details.className = 'confirm-option-details';
-
-                    const pageLabelEl = document.createElement('div');
-                    pageLabelEl.className = 'confirm-option-page';
-                    pageLabelEl.textContent = 'PDF Page ' + (pageNum + 1);
-                    if (isRecommended) {
-                        const recTag = document.createElement('span');
-                        recTag.className = 'confirm-recommended-tag';
-                        recTag.textContent = 'Recommended';
-                        pageLabelEl.appendChild(recTag);
-                    }
-
-                    const headerText = document.createElement('pre');
-                    headerText.className = 'confirm-option-header';
-                    const headerContent = (headers[section] && headers[section][String(pageNum)]) || '(no header text)';
-                    headerText.textContent = headerContent;
-
-                    details.appendChild(pageLabelEl);
-                    details.appendChild(headerText);
-                    optionDiv.appendChild(radio);
-                    optionDiv.appendChild(details);
-                    sectionDiv.appendChild(optionDiv);
-                }
-
-                confirmSections.appendChild(sectionDiv);
+                details.appendChild(pageLabelEl);
+                details.appendChild(headerText);
+                optionDiv.appendChild(radio);
+                optionDiv.appendChild(details);
+                confirmPnlOptions.appendChild(optionDiv);
             }
 
             confirmSection.style.display = 'block';
@@ -302,59 +333,47 @@
         confirmCancelBtn.addEventListener('click', () => {
             confirmSection.style.display = 'none';
             uploadSection.style.display = 'block';
-            identifyResult = null;
+            resetUpload();
         });
 
         confirmExtractBtn.addEventListener('click', async () => {
-            // Gather selected pages from radio buttons
-            const confirmedPages = {};
-
-            if (identifyResult.recommended_pages.notes_start !== undefined) {
-                confirmedPages.notes_start = identifyResult.recommended_pages.notes_start;
-            }
-
-            for (const section of ['pnl', 'bs', 'cf']) {
-                const radio = document.querySelector('input[name="page_' + section + '"]:checked');
-                if (radio) {
-                    confirmedPages[section] = parseInt(radio.value);
-                }
-            }
-
-            if (!confirmedPages.pnl && confirmedPages.pnl !== 0) {
-                showError('Please select a page for the Statement of Profit & Loss');
+            const radio = document.querySelector('input[name="pnl_page"]:checked');
+            if (!radio) {
+                showError('Please select a P&L page');
                 return;
             }
 
+            const result = identifyResults[currentReportIdx];
+            const confirmedPages = { ...result.recommended_pages };
+            confirmedPages.pnl = parseInt(radio.value);
+
             confirmSection.style.display = 'none';
             processingSection.style.display = 'flex';
-            updateStep(3);
-            processingText.textContent = 'Pages confirmed, extracting data...';
 
             try {
-                await runExtraction(confirmedPages);
+                await runExtraction(result, confirmedPages);
             } catch (err) {
                 processingSection.style.display = 'none';
                 showError(err.message);
             }
         });
 
-        // ---- Step 2: Extract with confirmed pages ----
-        async function runExtraction(confirmedPages) {
-            updateStep(4);
-            processingText.textContent = 'Extracting data from confirmed pages...';
+        // ---- Extraction for a single report ----
+        async function runExtraction(result, confirmedPages) {
+            updateStep(3);
+            processingText.textContent = 'Extracting data from P&L page...';
 
-            // Include metadata in the confirmed pages
             const pagesWithMeta = {
                 ...confirmedPages,
-                fy_current: identifyResult.fy_current,
-                fy_previous: identifyResult.fy_previous,
-                company_name: identifyResult.company_name,
+                fy_current: result.fy_current,
+                fy_previous: result.fy_previous,
+                company_name: result.company_name,
             };
 
             const formData = new FormData();
-            formData.append('job_id', identifyResult.job_id);
+            formData.append('job_id', result.job_id);
             formData.append('confirmed_pages', JSON.stringify(pagesWithMeta));
-            formData.append('original_filename', selectedFile ? selectedFile.name : 'report');
+            formData.append('original_filename', result.original_filename || 'report');
 
             const response = await fetch('/extract', {
                 method: 'POST',
@@ -366,7 +385,7 @@
                 throw new Error(err.detail || 'Extraction failed');
             }
 
-            updateStep(5);
+            updateStep(4);
             processingText.textContent = 'Download ready!';
 
             // Download the file
@@ -374,23 +393,31 @@
             const url = URL.createObjectURL(blob);
             const a = document.createElement('a');
             a.href = url;
-            a.download = selectedFile.name.replace('.pdf', '_financials.xlsx');
+            const origName = result.original_filename || 'report.pdf';
+            a.download = origName.replace('.pdf', '_financials.xlsx').replace('.PDF', '_financials.xlsx');
             document.body.appendChild(a);
             a.click();
             document.body.removeChild(a);
             URL.revokeObjectURL(url);
 
-            // Reset after download
-            setTimeout(() => {
-                processingSection.style.display = 'none';
-                uploadSection.style.display = 'block';
-                clearBtn.click();
-                identifyResult = null;
-            }, 2000);
+            // Move to next report in queue
+            currentReportIdx++;
+            if (currentReportIdx < identifyResults.length) {
+                updateStep(1);
+                processingText.textContent = 'Starting next report...';
+                setTimeout(() => processNextReport(), 1000);
+            } else {
+                processingText.textContent = 'All reports processed!';
+                setTimeout(() => {
+                    processingSection.style.display = 'none';
+                    uploadSection.style.display = 'block';
+                    resetUpload();
+                }, 2000);
+            }
         }
 
         function updateStep(n) {
-            for (let i = 1; i <= 5; i++) {
+            for (let i = 1; i <= 4; i++) {
                 const el = document.getElementById('step' + i);
                 el.classList.toggle('active', i <= n);
                 el.classList.toggle('done', i < n);
@@ -407,8 +434,7 @@
         retryBtn.addEventListener('click', () => {
             errorSection.style.display = 'none';
             uploadSection.style.display = 'block';
-            identifyResult = null;
-            clearBtn.click();
+            resetUpload();
         });
     </script>
 </body>
