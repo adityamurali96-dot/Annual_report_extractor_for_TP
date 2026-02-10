@@ -13,19 +13,33 @@ from app.pdf_utils import is_note_ref, is_value_line, parse_number
 # Stage 1: Find standalone financial statement pages
 # -------------------------------------------------------------------
 
-# P&L title variants found across different annual reports
-_PNL_TITLE_PATTERNS = [
-    'statement of profit and loss',
-    'profit and loss account',
-    'profit and loss statement',
-    'profit & loss account',
-    'profit & loss statement',
+
+# P&L title patterns found across different annual reports.
+# We use regex so matching is resilient to OCR/newline differences such as:
+#   - "Statement of Standalone Profit and Loss"
+#   - "Statement of Profit\nand Loss"
+#   - "Profit & Loss Account"
+_PNL_TITLE_REGEXES = [
+    re.compile(r'statement\s+of\s+(?:standalone\s+)?profit\s*(?:and|&)\s*loss'),
+    re.compile(r'profit\s*(?:and|&)\s*loss\s+account'),
+    re.compile(r'profit\s*(?:and|&)\s*loss\s+statement'),
 ]
+
+
+def _normalise_for_title_match(text: str) -> str:
+    """Normalise whitespace and punctuation for robust title matching."""
+    lower = text.lower()
+    # Join line breaks/hard spacing to handle split titles.
+    lower = re.sub(r'\s+', ' ', lower)
+    # Treat slash/hyphen variants as separators.
+    lower = lower.replace('/', ' ').replace('-', ' ')
+    return lower
 
 
 def _has_pnl_title(text_lower: str) -> bool:
     """Check if text contains any recognised P&L title variant."""
-    return any(p in text_lower for p in _PNL_TITLE_PATTERNS)
+    normalised = _normalise_for_title_match(text_lower)
+    return any(pattern.search(normalised) for pattern in _PNL_TITLE_REGEXES)
 
 
 def _has_consolidated_section(doc) -> bool:
