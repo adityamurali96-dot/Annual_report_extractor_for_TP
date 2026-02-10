@@ -1,19 +1,19 @@
 """
 FastAPI application for Annual Report Financial Extractor.
 
-Pipeline (PDF-only):
-  1. Accept PDF upload
+Pipeline (PDF-only, supports batch of up to 2 reports):
+  1. Accept PDF upload(s)
   2. Identify standalone financial statement pages (Claude API / regex)
-  3. If multiple candidates found, ask user to confirm page numbers
-  4. Extract page headers for company validation
-  5. Docling extracts tables from only those targeted pages
-  6. Write to Excel with header validation
+  3. If P&L confidence < 70%, ask user to confirm the P&L page number
+  4. Docling extracts tables from only those targeted pages
+  5. Write to Excel with header validation
 """
 
 import json
 import logging
 import uuid
 from pathlib import Path
+from typing import List
 
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
@@ -22,13 +22,15 @@ from fastapi.templating import Jinja2Templates
 
 from app.config import ANTHROPIC_API_KEY, MAX_UPLOAD_SIZE_MB, UPLOAD_DIR
 
+CONFIDENCE_THRESHOLD = 0.70
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
 
 app = FastAPI(
     title="Annual Report Extractor",
     description="Extract standalone financials from annual report PDFs into Excel",
-    version="4.0.0",
+    version="5.0.0",
 )
 
 # Static files & templates
@@ -53,40 +55,48 @@ async def health():
 
 
 @app.post("/identify")
-async def identify(file: UploadFile = File(...)):
+async def identify(files: List[UploadFile] = File(...)):
     """
-    Upload a PDF and identify standalone financial statement pages.
+    Upload one or two PDFs and identify standalone P&L pages.
 
-    Returns the recommended pages plus all candidates so the user can
-    confirm before extraction proceeds. This prevents wrong-page extraction
-    when there are multiple standalone sections or missing headings.
+    Returns a list of identification results (one per file). Each result
+    includes recommended pages, P&L candidate list, confidence score,
+    and whether user confirmation is needed (confidence < 70%).
     """
-    if not file.filename:
-        raise HTTPException(400, "No file provided")
+    if not files or len(files) > 2:
+        raise HTTPException(400, "Please upload 1 or 2 PDF files")
 
-    ext = Path(file.filename).suffix.lower()
-    if ext != ".pdf":
-        raise HTTPException(400, f"Only PDF files are accepted, got '{ext}'")
+    results = []
+    for file in files:
+        if not file.filename:
+            raise HTTPException(400, "No file provided")
 
-    content = await file.read()
-    size_mb = len(content) / (1024 * 1024)
-    if size_mb > MAX_UPLOAD_SIZE_MB:
-        raise HTTPException(400, f"File too large ({size_mb:.1f}MB). Max is {MAX_UPLOAD_SIZE_MB}MB")
+        ext = Path(file.filename).suffix.lower()
+        if ext != ".pdf":
+            raise HTTPException(400, f"Only PDF files are accepted, got '{ext}' for {file.filename}")
 
-    job_id = str(uuid.uuid4())[:8]
-    pdf_path = UPLOAD_DIR / f"{job_id}.pdf"
-    pdf_path.write_bytes(content)
+        content = await file.read()
+        size_mb = len(content) / (1024 * 1024)
+        if size_mb > MAX_UPLOAD_SIZE_MB:
+            raise HTTPException(400, f"File too large ({size_mb:.1f}MB). Max is {MAX_UPLOAD_SIZE_MB}MB")
 
-    logger.info(f"[{job_id}] Received {file.filename} ({size_mb:.1f}MB)")
+        job_id = str(uuid.uuid4())[:8]
+        pdf_path = UPLOAD_DIR / f"{job_id}.pdf"
+        pdf_path.write_bytes(content)
 
-    try:
-        result = _identify_pages(str(pdf_path), job_id)
-        return JSONResponse(result)
-    except Exception as e:
-        logger.exception(f"[{job_id}] Page identification failed")
-        if pdf_path.exists():
-            pdf_path.unlink()
-        raise HTTPException(500, f"Page identification failed: {str(e)}") from e
+        logger.info(f"[{job_id}] Received {file.filename} ({size_mb:.1f}MB)")
+
+        try:
+            result = _identify_pages(str(pdf_path), job_id)
+            result["original_filename"] = file.filename
+            results.append(result)
+        except Exception as e:
+            logger.exception(f"[{job_id}] Page identification failed")
+            if pdf_path.exists():
+                pdf_path.unlink()
+            raise HTTPException(500, f"Page identification failed for {file.filename}: {str(e)}") from e
+
+    return JSONResponse(results)
 
 
 @app.post("/extract")
@@ -131,17 +141,18 @@ async def extract(
 
 def _identify_pages(pdf_path: str, job_id: str) -> dict:
     """
-    Run page identification and candidate scanning.
+    Run page identification, scan for P&L candidates, compute confidence.
 
     Returns a dict with:
       - job_id: for the subsequent /extract call
       - recommended_pages: best-guess page numbers from Claude/regex
-      - candidates: all pages matching standalone patterns
-      - candidate_headers: header text for every candidate page
-      - needs_confirmation: True if multiple candidates for any section
-      - company_name, fy_current, fy_previous: metadata from identification
+      - pnl_candidates: list of all P&L candidate page numbers
+      - pnl_candidate_headers: header text for each P&L candidate page
+      - confidence: float 0.0-1.0 for P&L page identification
+      - needs_confirmation: True if confidence < 70%
+      - company_name, fy_current, fy_previous: metadata
     """
-    from app.extractor import find_all_standalone_candidates
+    from app.extractor import compute_pnl_confidence, find_all_standalone_candidates
     from app.extractor import find_standalone_pages as find_standalone_pages_regex
     from app.pdf_utils import extract_page_headers
 
@@ -149,6 +160,7 @@ def _identify_pages(pdf_path: str, job_id: str) -> dict:
     fy_current = "FY Current"
     fy_previous = "FY Previous"
     company_name = None
+    claude_identified = False
 
     # --- Claude API identification (primary) ---
     if ANTHROPIC_API_KEY:
@@ -164,6 +176,7 @@ def _identify_pages(pdf_path: str, job_id: str) -> dict:
 
             if raw_pages.get("pnl") is not None:
                 pages["pnl"] = raw_pages["pnl"]
+                claude_identified = True
             if raw_pages.get("balance_sheet") is not None:
                 pages["bs"] = raw_pages["balance_sheet"]
             if raw_pages.get("cash_flow") is not None:
@@ -187,45 +200,37 @@ def _identify_pages(pdf_path: str, job_id: str) -> dict:
             "Please ensure the PDF is an annual report with standalone financial statements."
         )
 
-    # --- Scan for ALL candidate pages ---
+    # --- Scan for ALL P&L candidate pages ---
     candidates = find_all_standalone_candidates(pdf_path)
-    logger.info(f"[{job_id}] All standalone candidates: {candidates}")
+    pnl_candidates = candidates.get("pnl", [])
+    logger.info(f"[{job_id}] P&L candidates: {pnl_candidates}")
 
-    # Ensure the recommended page is always included in candidates
-    for section in ["pnl", "bs", "cf"]:
-        if section in pages and pages[section] not in candidates.get(section, []):
-            candidates.setdefault(section, []).insert(0, pages[section])
+    # Ensure the recommended page is always in the candidate list
+    if pages["pnl"] not in pnl_candidates:
+        pnl_candidates.insert(0, pages["pnl"])
 
-    # --- Check if confirmation is needed ---
-    needs_confirmation = any(
-        len(candidate_list) > 1
-        for candidate_list in candidates.values()
-    )
+    # --- Compute confidence ---
+    confidence = compute_pnl_confidence(len(pnl_candidates), claude_identified)
+    needs_confirmation = confidence < CONFIDENCE_THRESHOLD
 
-    # --- Extract headers for ALL candidate pages (for user review) ---
-    all_candidate_pages = {}
-    for section, page_list in candidates.items():
-        for page_num in page_list:
-            all_candidate_pages[f"{section}_p{page_num}"] = page_num
+    logger.info(f"[{job_id}] P&L confidence: {confidence:.0%} "
+                f"(candidates={len(pnl_candidates)}, claude={claude_identified}) "
+                f"-> {'PROMPT' if needs_confirmation else 'AUTO-PROCEED'}")
 
-    candidate_headers = extract_page_headers(pdf_path, all_candidate_pages, num_lines=5)
-
-    # Reorganize headers by section for cleaner frontend consumption
-    # Use string keys for page numbers so JSON serialization works cleanly
-    headers_by_section: dict[str, dict[str, str]] = {}
-    for section, page_list in candidates.items():
-        headers_by_section[section] = {}
-        for page_num in page_list:
-            key = f"{section}_p{page_num}"
-            headers_by_section[section][str(page_num)] = candidate_headers.get(key, "(no header text)")
-
-    logger.info(f"[{job_id}] Needs confirmation: {needs_confirmation}")
+    # --- Extract headers for P&L candidate pages (for user review) ---
+    pnl_header_map = {f"pnl_p{pg}": pg for pg in pnl_candidates}
+    raw_headers = extract_page_headers(pdf_path, pnl_header_map, num_lines=5)
+    pnl_candidate_headers = {
+        str(pg): raw_headers.get(f"pnl_p{pg}", "(no header text)")
+        for pg in pnl_candidates
+    }
 
     return {
         "job_id": job_id,
         "recommended_pages": pages,
-        "candidates": candidates,
-        "candidate_headers": headers_by_section,
+        "pnl_candidates": pnl_candidates,
+        "pnl_candidate_headers": pnl_candidate_headers,
+        "confidence": round(confidence, 2),
         "needs_confirmation": needs_confirmation,
         "company_name": company_name,
         "fy_current": fy_current,

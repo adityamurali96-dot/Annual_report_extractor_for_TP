@@ -36,39 +36,54 @@ def find_standalone_pages(pdf_path: str) -> tuple[dict, int]:
 
 def find_all_standalone_candidates(pdf_path: str) -> dict[str, list[int]]:
     """
-    Scan ALL pages for potential standalone financial statement matches.
+    Scan ALL pages for potential standalone P&L matches.
 
-    Unlike find_standalone_pages() which returns only the first match per
-    section, this returns ALL candidate page numbers so the user can confirm
+    Unlike find_standalone_pages() which returns only the first match,
+    this returns ALL candidate P&L page numbers so the user can confirm
     when there is ambiguity (e.g. pages without headings or multiple matches).
 
     Returns:
-        Dict mapping section keys to lists of 0-indexed page numbers:
-        {"pnl": [45, 102], "bs": [43, 100], "cf": [48, 105]}
+        Dict with "pnl" key mapping to list of 0-indexed page numbers:
+        {"pnl": [45, 102]}
     """
     doc = fitz.open(pdf_path)
-    candidates: dict[str, list[int]] = {"pnl": [], "bs": [], "cf": []}
+    candidates: dict[str, list[int]] = {"pnl": []}
 
     for i in range(doc.page_count):
         text = doc[i].get_text()
         lower = text.lower()
 
-        is_standalone = 'standalone' in lower
-
-        # P&L candidates
-        if 'statement of profit and loss' in lower and is_standalone:
+        if 'statement of profit and loss' in lower and 'standalone' in lower:
             candidates['pnl'].append(i)
-
-        # Balance Sheet candidates
-        if 'balance sheet' in lower and is_standalone:
-            candidates['bs'].append(i)
-
-        # Cash Flow candidates
-        if ('cash flow' in lower or 'cashflow' in lower) and is_standalone:
-            candidates['cf'].append(i)
 
     doc.close()
     return candidates
+
+
+def compute_pnl_confidence(num_candidates: int, claude_identified: bool) -> float:
+    """
+    Compute confidence score (0.0-1.0) for the P&L page identification.
+
+    Logic:
+      - 1 candidate → 1.0 (certain)
+      - 2 candidates + Claude picked one → 0.75 (above 70% threshold)
+      - 2 candidates, no Claude → 0.50 (below threshold → prompt user)
+      - 3+ candidates + Claude → 0.58 (below threshold → prompt user)
+      - 3+ candidates, no Claude → 0.33 (low → prompt user)
+      - 0 candidates → 0.0
+
+    The 70% threshold is used to decide whether to prompt the user.
+    """
+    if num_candidates <= 0:
+        return 0.0
+    if num_candidates == 1:
+        return 1.0
+
+    base = 1.0 / num_candidates
+    if claude_identified:
+        base += 0.25
+
+    return min(base, 1.0)
 
 
 # -------------------------------------------------------------------

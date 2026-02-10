@@ -1,11 +1,14 @@
 """
-CLI script for extracting standalone financials from a PDF annual report.
+CLI script for extracting standalone financials from PDF annual reports.
 
-Pipeline:
-  1. Claude API (Sonnet 4.5) identifies standalone financial statement pages
-  2. Extract page headers for company validation
-  3. Docling extracts tables from only those targeted pages
-  4. Write to Excel
+Supports processing up to 2 PDF files sequentially (queued).
+
+Pipeline (per file):
+  1. Identify standalone financial statement pages (Claude API / regex)
+  2. If P&L confidence < 70%, prompt user to confirm the P&L page
+  3. Extract page headers for company validation
+  4. Docling extracts tables from only those targeted pages
+  5. Write to Excel
 """
 
 import os
@@ -19,6 +22,7 @@ from app.docling_extractor import extract_note_docling, extract_pnl_docling
 from app.excel_writer import create_excel
 from app.extractor import (
     compute_metrics,
+    compute_pnl_confidence,
     find_all_standalone_candidates,
     find_note_page,
     validate_note_extraction,
@@ -26,11 +30,7 @@ from app.extractor import (
 from app.extractor import find_standalone_pages as find_standalone_pages_regex
 from app.pdf_utils import extract_page_headers
 
-SECTION_LABELS = {
-    "pnl": "Statement of Profit & Loss",
-    "bs": "Balance Sheet",
-    "cf": "Cash Flow Statement",
-}
+CONFIDENCE_THRESHOLD = 0.70
 
 
 def run_extraction(pdf_path: str, output_path: str):
@@ -45,6 +45,7 @@ def run_extraction(pdf_path: str, output_path: str):
     fy_current = "FY Current"
     fy_previous = "FY Previous"
     company_name = None
+    claude_identified = False
 
     if ANTHROPIC_API_KEY:
         print("  Using Claude Sonnet 4.5 for page identification...")
@@ -59,6 +60,7 @@ def run_extraction(pdf_path: str, output_path: str):
 
             if raw_pages.get("pnl") is not None:
                 pages["pnl"] = raw_pages["pnl"]
+                claude_identified = True
             if raw_pages.get("balance_sheet") is not None:
                 pages["bs"] = raw_pages["balance_sheet"]
             if raw_pages.get("cash_flow") is not None:
@@ -85,66 +87,57 @@ def run_extraction(pdf_path: str, output_path: str):
     print(f"  Standalone pages: {pages}")
 
     # ==================================================================
-    # STAGE 1b: Check for multiple standalone candidates & confirm
+    # STAGE 1b: Check P&L confidence & confirm if needed
     # ==================================================================
     candidates = find_all_standalone_candidates(pdf_path)
-    has_multiple = any(len(v) > 1 for v in candidates.values())
+    pnl_candidates = candidates.get("pnl", [])
 
-    # Ensure recommended pages are in the candidate lists
-    for section in ["pnl", "bs", "cf"]:
-        if section in pages and pages[section] not in candidates.get(section, []):
-            candidates.setdefault(section, []).insert(0, pages[section])
+    # Ensure recommended page is in the candidate list
+    if pages["pnl"] not in pnl_candidates:
+        pnl_candidates.insert(0, pages["pnl"])
 
-    if has_multiple:
-        print("\n  ** Multiple standalone financial pages detected **")
-        print("  Please confirm the correct page for each section.\n")
+    confidence = compute_pnl_confidence(len(pnl_candidates), claude_identified)
+    print(f"  P&L confidence: {confidence:.0%} ({len(pnl_candidates)} candidate(s), "
+          f"claude={'yes' if claude_identified else 'no'})")
 
-        # Show candidates with headers for each section
-        candidate_page_map = {}
-        for section, page_list in candidates.items():
-            for pg in page_list:
-                candidate_page_map[f"{section}_p{pg}"] = pg
-        candidate_headers = extract_page_headers(pdf_path, candidate_page_map, num_lines=5)
+    if confidence < CONFIDENCE_THRESHOLD:
+        print(f"\n  ** P&L confidence below {CONFIDENCE_THRESHOLD:.0%} - confirmation needed **")
+        print("  Please confirm the correct P&L page.\n")
 
-        for section in ["pnl", "bs", "cf"]:
-            page_list = candidates.get(section, [])
-            if not page_list:
-                continue
+        # Show P&L candidates with headers
+        pnl_header_map = {f"pnl_p{pg}": pg for pg in pnl_candidates}
+        candidate_headers = extract_page_headers(pdf_path, pnl_header_map, num_lines=5)
+        recommended = pages["pnl"]
 
-            label = SECTION_LABELS.get(section, section)
-            recommended = pages.get(section)
+        print("  --- Statement of Profit & Loss ---")
+        for idx, pg in enumerate(pnl_candidates):
+            rec_tag = " [RECOMMENDED]" if pg == recommended else ""
+            header = candidate_headers.get(f"pnl_p{pg}", "(no header text)")
+            header_preview = header.replace('\n', ' | ')[:100]
+            print(f"    [{idx + 1}] PDF Page {pg + 1}{rec_tag}")
+            print(f"        Header: {header_preview}")
+        print()
 
-            print(f"  --- {label} ---")
-            for idx, pg in enumerate(page_list):
-                rec_tag = " [RECOMMENDED]" if pg == recommended else ""
-                header = candidate_headers.get(f"{section}_p{pg}", "(no header text)")
-                header_preview = header.replace('\n', ' | ')[:100]
-                print(f"    [{idx + 1}] PDF Page {pg + 1}{rec_tag}")
-                print(f"        Header: {header_preview}")
-            print()
+        while True:
+            default_idx = pnl_candidates.index(recommended) + 1 if recommended in pnl_candidates else 1
+            choice = input(f"  Select P&L page [1-{len(pnl_candidates)}] "
+                           f"(default={default_idx}): ").strip()
+            if choice == "":
+                chosen_idx = default_idx - 1
+                break
+            try:
+                chosen_idx = int(choice) - 1
+                if 0 <= chosen_idx < len(pnl_candidates):
+                    break
+                print(f"    Invalid choice. Enter 1-{len(pnl_candidates)}.")
+            except ValueError:
+                print(f"    Invalid input. Enter a number 1-{len(pnl_candidates)}.")
 
-            if len(page_list) > 1:
-                while True:
-                    default_idx = page_list.index(recommended) + 1 if recommended in page_list else 1
-                    choice = input(f"  Select {label} page [1-{len(page_list)}] "
-                                   f"(default={default_idx}): ").strip()
-                    if choice == "":
-                        chosen_idx = default_idx - 1
-                        break
-                    try:
-                        chosen_idx = int(choice) - 1
-                        if 0 <= chosen_idx < len(page_list):
-                            break
-                        print(f"    Invalid choice. Enter 1-{len(page_list)}.")
-                    except ValueError:
-                        print(f"    Invalid input. Enter a number 1-{len(page_list)}.")
-
-                pages[section] = page_list[chosen_idx]
-                print(f"  -> Selected PDF Page {pages[section] + 1}\n")
-
+        pages["pnl"] = pnl_candidates[chosen_idx]
+        print(f"  -> Selected PDF Page {pages['pnl'] + 1}")
         print(f"  Confirmed pages: {pages}")
     else:
-        print("  Single candidate per section - no confirmation needed.")
+        print("  P&L page confident - no confirmation needed.")
 
     # ==================================================================
     # STAGE 2: Extract page headers for validation
@@ -246,20 +239,52 @@ def run_extraction(pdf_path: str, output_path: str):
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
-        print("Usage: python extract_standalone_financials.py <pdf_path> [output_path]")
-        print("  pdf_path:    Path to the annual report PDF")
-        print("  output_path: (optional) Path for output Excel file")
+        print("Usage: python extract_standalone_financials.py <pdf_path> [pdf_path_2] [output_dir]")
+        print("  pdf_path:    Path to the annual report PDF (up to 2 files)")
+        print("  output_dir:  (optional) Directory for output Excel files")
         sys.exit(1)
 
-    pdf_path = sys.argv[1]
-    output_path = sys.argv[2] if len(sys.argv) > 2 else pdf_path.rsplit(".", 1)[0] + "_financials.xlsx"
+    # Collect PDF paths and optional output directory
+    pdf_paths = []
+    output_dir = None
+    for arg in sys.argv[1:]:
+        if arg.lower().endswith(".pdf"):
+            pdf_paths.append(arg)
+        elif os.path.isdir(arg):
+            output_dir = arg
+        else:
+            # Treat as output path for single-file mode (backward compat)
+            output_dir = arg
 
-    if not os.path.exists(pdf_path):
-        print(f"ERROR: File not found: {pdf_path}")
+    if not pdf_paths:
+        print("ERROR: No PDF files provided")
         sys.exit(1)
 
-    if not pdf_path.lower().endswith(".pdf"):
-        print("ERROR: Only PDF files are accepted")
+    if len(pdf_paths) > 2:
+        print("ERROR: Maximum 2 PDF files supported")
         sys.exit(1)
 
-    run_extraction(pdf_path, output_path)
+    for pdf_path in pdf_paths:
+        if not os.path.exists(pdf_path):
+            print(f"ERROR: File not found: {pdf_path}")
+            sys.exit(1)
+
+    # Process each PDF
+    for i, pdf_path in enumerate(pdf_paths):
+        if len(pdf_paths) > 1:
+            print(f"\n{'='*70}")
+            print(f"  REPORT {i + 1} of {len(pdf_paths)}: {os.path.basename(pdf_path)}")
+            print(f"{'='*70}\n")
+
+        if output_dir and os.path.isdir(output_dir):
+            base = os.path.splitext(os.path.basename(pdf_path))[0]
+            out_path = os.path.join(output_dir, base + "_financials.xlsx")
+        elif output_dir and len(pdf_paths) == 1:
+            out_path = output_dir
+        else:
+            out_path = pdf_path.rsplit(".", 1)[0] + "_financials.xlsx"
+
+        run_extraction(pdf_path, out_path)
+
+    if len(pdf_paths) > 1:
+        print(f"\nAll {len(pdf_paths)} reports processed.")
