@@ -257,17 +257,20 @@ def _run_extraction(pdf_path: str, job_id: str) -> dict:
                 f"{list(pnl['items'].keys())}")
 
     # ------------------------------------------------------------------
-    # Step 4: Docling extracts note breakup from standalone notes
+    # Step 4: Docling extracts note breakup from notes section
     # ------------------------------------------------------------------
     note_items = []
     note_total = None
     note_num = pnl["note_refs"].get("Other expenses")
+    # Use the actual matched label (e.g. "Administrative Charges") as
+    # the keyword for note page search, not always "Other expenses"
+    oe_label = pnl.get("operating_expense_label", "Other expenses")
 
     search_start = pages.get("notes_start", pages["pnl"])
 
     if note_num:
         note_page, _ = find_note_page(
-            pdf_path, note_num, search_start, "Other expenses"
+            pdf_path, note_num, search_start, oe_label
         )
         if note_page is not None:
             logger.info(f"[{job_id}] Docling extracting Note {note_num} from page {note_page}")

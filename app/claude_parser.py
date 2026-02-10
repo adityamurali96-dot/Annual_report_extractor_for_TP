@@ -53,7 +53,7 @@ CRITICAL RULES:
 3. The standalone section usually appears BEFORE the consolidated section in Indian annual reports, but not always.
 
 Look for these sections:
-1. **Statement of Profit and Loss** - the P&L statement
+1. **Statement of Profit and Loss** (may also be titled "Profit and Loss Account" or "Profit and Loss Statement") - the P&L statement
 2. **Balance Sheet** - assets and liabilities
 3. **Cash Flow Statement** - cash flows
 4. **Notes to Financial Statements** - the starting page of notes

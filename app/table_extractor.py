@@ -434,7 +434,7 @@ def find_standalone_pages(pdf_path: str) -> tuple[dict, int]:
     Falls back to matching without "standalone" for single-entity reports
     that have no consolidated section.
     """
-    from app.extractor import _has_consolidated_section
+    from app.extractor import _has_consolidated_section, _has_pnl_title
 
     doc = fitz.open(pdf_path)
     pages = {}
@@ -445,7 +445,7 @@ def find_standalone_pages(pdf_path: str) -> tuple[dict, int]:
         text = doc[i].get_text()
         lower = text.lower()
 
-        if 'statement of profit and loss' in lower and 'standalone' in lower and 'pnl' not in pages:
+        if _has_pnl_title(lower) and 'standalone' in lower and 'pnl' not in pages:
             pages['pnl'] = i
         if 'balance sheet' in lower and 'standalone' in lower and 'bs' not in pages:
             pages['bs'] = i
@@ -457,7 +457,7 @@ def find_standalone_pages(pdf_path: str) -> tuple[dict, int]:
         for i in range(total):
             text = doc[i].get_text()
             lower = text.lower()
-            if 'statement of profit and loss' in lower and 'pnl' not in pages:
+            if _has_pnl_title(lower) and 'pnl' not in pages:
                 pages['pnl'] = i
             if 'balance sheet' in lower and 'bs' not in pages:
                 if len(text) > 200:
