@@ -39,25 +39,31 @@ def _get_client():
 # Identify standalone financial statement pages
 # -------------------------------------------------------------------
 
-IDENTIFY_PAGES_PROMPT = """You are a financial document analyst. I will give you text extracted from pages of an Indian annual report PDF. Your ONLY job is to identify which pages contain the STANDALONE financial statements.
+IDENTIFY_PAGES_PROMPT = """You are a financial document analyst. I will give you text extracted from pages of an Indian annual report PDF. Your job is to identify which pages contain the financial statements to extract.
 
 CRITICAL RULES:
-- You MUST find the STANDALONE statements only. Ignore ALL "Consolidated" statements entirely.
-- Annual reports often contain BOTH standalone and consolidated financials. The standalone section is typically labeled "Standalone" in the header or title of each page.
-- If a page header says "Consolidated", skip it completely.
-- The standalone section usually appears BEFORE the consolidated section in Indian annual reports, but not always.
+1. **Two types of annual reports exist:**
+   - **Multi-section reports** contain BOTH "Standalone" and "Consolidated" financial statements. In these reports, you MUST find only the STANDALONE statements. Ignore ALL pages labelled "Consolidated".
+   - **Single-entity reports** have only ONE set of financial statements (no "Standalone" or "Consolidated" labels). In these reports, identify the financial statements directly — they are implicitly standalone.
 
-Look for these STANDALONE sections:
-1. **Statement of Profit and Loss** (Standalone) - the P&L statement
-2. **Balance Sheet** (Standalone) - assets and liabilities
-3. **Cash Flow Statement** (Standalone) - cash flows
-4. **Notes to Financial Statements** - the starting page of STANDALONE notes (not consolidated notes)
+2. **How to distinguish:**
+   - If you see pages with headers containing "Consolidated" (e.g., "Consolidated Statement of Profit and Loss"), this is a multi-section report. Find the pages labelled "Standalone" instead.
+   - If NO page mentions "Consolidated" at all, this is a single-entity report. The financial statements you find are the ones to use.
+
+3. The standalone section usually appears BEFORE the consolidated section in Indian annual reports, but not always.
+
+Look for these sections:
+1. **Statement of Profit and Loss** - the P&L statement
+2. **Balance Sheet** - assets and liabilities
+3. **Cash Flow Statement** - cash flows
+4. **Notes to Financial Statements** - the starting page of notes
 
 Also extract:
-- The **company name** exactly as it appears in the standalone financial statement headers (e.g., "XYZ Limited", "ABC Corp Ltd")
-- The **page header text** for each identified standalone page - this is the full text of the first 3-4 lines at the top of each page (for validation)
+- The **company name** exactly as it appears in the financial statement headers (e.g., "XYZ Limited", "ABC Corp Ltd")
+- The **page header text** for each identified page - this is the full text of the first 3-4 lines at the top of each page (for validation)
 - The **fiscal years** being reported (e.g., "FY 2024-25" and "FY 2023-24", or "March 31, 2025" and "March 31, 2024")
 - The **currency unit** (e.g., "INR Million", "Rs. in Crores", "Rs. in Lakhs")
+- Whether this is a **single-entity report** (no consolidated section found) — set "report_type" to "single_entity" or "multi_section"
 
 Respond with ONLY a JSON object (no markdown, no explanation):
 {
@@ -65,6 +71,7 @@ Respond with ONLY a JSON object (no markdown, no explanation):
     "currency": "INR Million",
     "fiscal_year_current": "FY 2024-25",
     "fiscal_year_previous": "FY 2023-24",
+    "report_type": "single_entity or multi_section",
     "pages": {
         "pnl": <page_number or null>,
         "balance_sheet": <page_number or null>,

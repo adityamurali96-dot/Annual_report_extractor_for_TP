@@ -39,7 +39,7 @@ def run_extraction(pdf_path: str, output_path: str):
     # ==================================================================
     # STAGE 1: Identify standalone financial statement pages
     # ==================================================================
-    print("STAGE 1: Identify Standalone Financial Pages")
+    print("STAGE 1: Identify Financial Statement Pages")
 
     pages = {}
     fy_current = "FY Current"
@@ -81,10 +81,10 @@ def run_extraction(pdf_path: str, output_path: str):
         pages, _ = find_standalone_pages_regex(pdf_path)
 
     if "pnl" not in pages:
-        print("ERROR: Could not find Standalone P&L page.")
+        print("ERROR: Could not find a P&L (Statement of Profit and Loss) page.")
         sys.exit(1)
 
-    print(f"  Standalone pages: {pages}")
+    print(f"  Financial statement pages: {pages}")
 
     # ==================================================================
     # STAGE 1b: Check for multiple standalone P&L candidates and warn
@@ -102,7 +102,7 @@ def run_extraction(pdf_path: str, output_path: str):
     if len(pnl_candidates) > 1:
         candidate_pages_display = ", ".join(str(p + 1) for p in pnl_candidates)
         warn_msg = (
-            f"WARNING: Multiple standalone P&L pages detected (PDF pages: {candidate_pages_display}). "
+            f"WARNING: Multiple P&L pages detected (PDF pages: {candidate_pages_display}). "
             f"Extracting from page {pages['pnl'] + 1}. "
             f"Please verify the totals in the output Excel to ensure the correct page was used."
         )
@@ -121,7 +121,7 @@ def run_extraction(pdf_path: str, output_path: str):
     # ==================================================================
     # STAGE 3: Docling extracts P&L from targeted standalone page(s)
     # ==================================================================
-    print(f"\nSTAGE 3: Docling - Extract P&L from standalone page {pages['pnl']}")
+    print(f"\nSTAGE 3: Docling - Extract P&L from page {pages['pnl']}")
 
     pnl = extract_pnl_docling(pdf_path, pages["pnl"])
 

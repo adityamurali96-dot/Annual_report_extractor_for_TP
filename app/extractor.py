@@ -13,22 +13,60 @@ from app.pdf_utils import is_note_ref, is_value_line, parse_number
 # Stage 1: Find standalone financial statement pages
 # -------------------------------------------------------------------
 
+def _has_consolidated_section(doc) -> bool:
+    """Check if the PDF contains consolidated financial statements.
+
+    If it does, standalone and consolidated sections coexist and we must
+    distinguish between them.  If it doesn't, the report is a single-entity
+    report and every financial statement is implicitly standalone.
+    """
+    for i in range(doc.page_count):
+        text = doc[i].get_text().lower()
+        if 'consolidated' in text and (
+            'statement of profit and loss' in text
+            or 'balance sheet' in text
+            or 'cash flow' in text
+        ):
+            return True
+    return False
+
+
 def find_standalone_pages(pdf_path: str) -> tuple[dict, int]:
-    """Identify pages containing standalone financial statements."""
+    """Identify pages containing standalone financial statements.
+
+    First tries to match pages labelled "standalone".  If none are found and
+    the report has no consolidated section (i.e. it's a single-entity report),
+    falls back to matching pages with just the statement name.
+    """
     doc = fitz.open(pdf_path)
     pages = {}
+
+    # --- Pass 1: look for explicitly labelled "standalone" pages ---
     for i in range(doc.page_count):
         text = doc[i].get_text()
         lower = text.lower()
-        # P&L
         if 'statement of profit and loss' in lower and 'standalone' in lower and 'pnl' not in pages:
             pages['pnl'] = i
-        # Balance Sheet
         if 'balance sheet' in lower and 'standalone' in lower and 'bs' not in pages:
             pages['bs'] = i
-        # Cash Flow
         if 'cash flow' in lower and 'standalone' in lower and 'cf' not in pages:
             pages['cf'] = i
+
+    # --- Pass 2: single-entity fallback (no consolidated section) ---
+    if 'pnl' not in pages and not _has_consolidated_section(doc):
+        for i in range(doc.page_count):
+            text = doc[i].get_text()
+            lower = text.lower()
+            if 'statement of profit and loss' in lower and 'pnl' not in pages:
+                pages['pnl'] = i
+            if 'balance sheet' in lower and 'bs' not in pages:
+                # Avoid matching table-of-contents or index pages
+                if len(text) > 200:
+                    pages['bs'] = i
+            if 'cash flow' in lower and 'cf' not in pages:
+                if len(text) > 200:
+                    pages['cf'] = i
+
     total = doc.page_count
     doc.close()
     return pages, total
@@ -42,19 +80,29 @@ def find_all_standalone_candidates(pdf_path: str) -> dict[str, list[int]]:
     this returns ALL candidate P&L page numbers so the user can confirm
     when there is ambiguity (e.g. pages without headings or multiple matches).
 
+    For single-entity reports (no consolidated section), pages are matched
+    by "statement of profit and loss" alone.
+
     Returns:
         Dict with "pnl" key mapping to list of 0-indexed page numbers:
         {"pnl": [45, 102]}
     """
     doc = fitz.open(pdf_path)
     candidates: dict[str, list[int]] = {"pnl": []}
+    has_consolidated = _has_consolidated_section(doc)
 
     for i in range(doc.page_count):
         text = doc[i].get_text()
         lower = text.lower()
 
-        if 'statement of profit and loss' in lower and 'standalone' in lower:
-            candidates['pnl'].append(i)
+        if 'statement of profit and loss' in lower:
+            if has_consolidated:
+                # Only match explicitly labelled "standalone" pages
+                if 'standalone' in lower:
+                    candidates['pnl'].append(i)
+            else:
+                # Single-entity report: any P&L page is a candidate
+                candidates['pnl'].append(i)
 
     doc.close()
     return candidates
