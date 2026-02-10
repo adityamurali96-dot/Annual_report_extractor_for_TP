@@ -5,7 +5,7 @@ Supports processing up to 2 PDF files sequentially (queued).
 
 Pipeline (per file):
   1. Identify standalone financial statement pages (Claude API / regex)
-  2. If P&L confidence < 70%, prompt user to confirm the P&L page
+  2. Warn if multiple standalone P&L pages detected
   3. Extract page headers for company validation
   4. Docling extracts tables from only those targeted pages
   5. Write to Excel
@@ -30,11 +30,11 @@ from app.extractor import (
 from app.extractor import find_standalone_pages as find_standalone_pages_regex
 from app.pdf_utils import extract_page_headers
 
-CONFIDENCE_THRESHOLD = 0.70
-
 
 def run_extraction(pdf_path: str, output_path: str):
     """Run the full extraction pipeline on a PDF file."""
+
+    warnings: list[str] = []
 
     # ==================================================================
     # STAGE 1: Identify standalone financial statement pages
@@ -87,12 +87,11 @@ def run_extraction(pdf_path: str, output_path: str):
     print(f"  Standalone pages: {pages}")
 
     # ==================================================================
-    # STAGE 1b: Check P&L confidence & confirm if needed
+    # STAGE 1b: Check for multiple standalone P&L candidates and warn
     # ==================================================================
     candidates = find_all_standalone_candidates(pdf_path)
     pnl_candidates = candidates.get("pnl", [])
 
-    # Ensure recommended page is in the candidate list
     if pages["pnl"] not in pnl_candidates:
         pnl_candidates.insert(0, pages["pnl"])
 
@@ -100,44 +99,15 @@ def run_extraction(pdf_path: str, output_path: str):
     print(f"  P&L confidence: {confidence:.0%} ({len(pnl_candidates)} candidate(s), "
           f"claude={'yes' if claude_identified else 'no'})")
 
-    if confidence < CONFIDENCE_THRESHOLD:
-        print(f"\n  ** P&L confidence below {CONFIDENCE_THRESHOLD:.0%} - confirmation needed **")
-        print("  Please confirm the correct P&L page.\n")
-
-        # Show P&L candidates with headers
-        pnl_header_map = {f"pnl_p{pg}": pg for pg in pnl_candidates}
-        candidate_headers = extract_page_headers(pdf_path, pnl_header_map, num_lines=5)
-        recommended = pages["pnl"]
-
-        print("  --- Statement of Profit & Loss ---")
-        for idx, pg in enumerate(pnl_candidates):
-            rec_tag = " [RECOMMENDED]" if pg == recommended else ""
-            header = candidate_headers.get(f"pnl_p{pg}", "(no header text)")
-            header_preview = header.replace('\n', ' | ')[:100]
-            print(f"    [{idx + 1}] PDF Page {pg + 1}{rec_tag}")
-            print(f"        Header: {header_preview}")
-        print()
-
-        while True:
-            default_idx = pnl_candidates.index(recommended) + 1 if recommended in pnl_candidates else 1
-            choice = input(f"  Select P&L page [1-{len(pnl_candidates)}] "
-                           f"(default={default_idx}): ").strip()
-            if choice == "":
-                chosen_idx = default_idx - 1
-                break
-            try:
-                chosen_idx = int(choice) - 1
-                if 0 <= chosen_idx < len(pnl_candidates):
-                    break
-                print(f"    Invalid choice. Enter 1-{len(pnl_candidates)}.")
-            except ValueError:
-                print(f"    Invalid input. Enter a number 1-{len(pnl_candidates)}.")
-
-        pages["pnl"] = pnl_candidates[chosen_idx]
-        print(f"  -> Selected PDF Page {pages['pnl'] + 1}")
-        print(f"  Confirmed pages: {pages}")
-    else:
-        print("  P&L page confident - no confirmation needed.")
+    if len(pnl_candidates) > 1:
+        candidate_pages_display = ", ".join(str(p + 1) for p in pnl_candidates)
+        warn_msg = (
+            f"WARNING: Multiple standalone P&L pages detected (PDF pages: {candidate_pages_display}). "
+            f"Extracting from page {pages['pnl'] + 1}. "
+            f"Please verify the totals in the output Excel to ensure the correct page was used."
+        )
+        warnings.append(warn_msg)
+        print(f"\n  ** {warn_msg} **\n")
 
     # ==================================================================
     # STAGE 2: Extract page headers for validation
@@ -207,6 +177,11 @@ def run_extraction(pdf_path: str, output_path: str):
         status = "PASS" if check["ok"] else "FAIL"
         print(f"  [{status:4s}] {check['name']:55s} | "
               f"Got: {check['actual']:>14,.2f}  Expected: {check['expected']:>14,.2f}")
+        if not check["ok"]:
+            warnings.append(
+                f"Validation FAIL: {check['name']} "
+                f"(got {check['actual']:.2f}, expected {check['expected']:.2f})"
+            )
 
     # ==================================================================
     # STAGE 5: Compute metrics & generate Excel
@@ -231,10 +206,25 @@ def run_extraction(pdf_path: str, output_path: str):
         "note_number": note_num,
         "note_validation": validation,
         "page_headers": page_headers,
+        "warnings": warnings,
     }
 
     create_excel(data, output_path)
     print(f"  Saved: {output_path}")
+
+    # ==================================================================
+    # Print warnings summary
+    # ==================================================================
+    if warnings:
+        print(f"\n{'='*70}")
+        print(f"  REVIEW REQUIRED - {len(warnings)} warning(s):")
+        print(f"{'='*70}")
+        for w in warnings:
+            print(f"  - {w}")
+        print(f"{'='*70}")
+        print("  Please check the Validation sheet in the Excel output.")
+
+    return warnings
 
 
 if __name__ == "__main__":
@@ -270,6 +260,7 @@ if __name__ == "__main__":
             sys.exit(1)
 
     # Process each PDF
+    all_warnings = []
     for i, pdf_path in enumerate(pdf_paths):
         if len(pdf_paths) > 1:
             print(f"\n{'='*70}")
@@ -284,7 +275,10 @@ if __name__ == "__main__":
         else:
             out_path = pdf_path.rsplit(".", 1)[0] + "_financials.xlsx"
 
-        run_extraction(pdf_path, out_path)
+        file_warnings = run_extraction(pdf_path, out_path)
+        all_warnings.extend(file_warnings)
 
     if len(pdf_paths) > 1:
         print(f"\nAll {len(pdf_paths)} reports processed.")
+        if all_warnings:
+            print(f"Total warnings across all reports: {len(all_warnings)}")

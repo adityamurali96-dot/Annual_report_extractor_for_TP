@@ -2,27 +2,23 @@
 FastAPI application for Annual Report Financial Extractor.
 
 Pipeline (PDF-only, supports batch of up to 2 reports):
-  1. Accept PDF upload(s)
+  1. Accept 1 or 2 PDF uploads
   2. Identify standalone financial statement pages (Claude API / regex)
-  3. If P&L confidence < 70%, ask user to confirm the P&L page number
-  4. Docling extracts tables from only those targeted pages
-  5. Write to Excel with header validation
+  3. Extract tables from targeted pages (auto-proceeds, no confirmation)
+  4. Return Excel file(s) with warnings if multiple standalone sections detected
 """
 
-import json
 import logging
 import uuid
 from pathlib import Path
 from typing import List
 
-from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi import FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
 from app.config import ANTHROPIC_API_KEY, MAX_UPLOAD_SIZE_MB, UPLOAD_DIR
-
-CONFIDENCE_THRESHOLD = 0.70
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
@@ -30,7 +26,7 @@ logger = logging.getLogger(__name__)
 app = FastAPI(
     title="Annual Report Extractor",
     description="Extract standalone financials from annual report PDFs into Excel",
-    version="5.0.0",
+    version="5.1.0",
 )
 
 # Static files & templates
@@ -54,19 +50,20 @@ async def health():
     return {"status": "ok", "api_key_configured": bool(ANTHROPIC_API_KEY)}
 
 
-@app.post("/identify")
-async def identify(files: List[UploadFile] = File(...)):
+@app.post("/extract")
+async def extract(files: List[UploadFile] = File(...)):
     """
-    Upload one or two PDFs and identify standalone P&L pages.
+    Upload 1 or 2 PDF annual reports and extract standalone financials.
 
-    Returns a list of identification results (one per file). Each result
-    includes recommended pages, P&L candidate list, confidence score,
-    and whether user confirmation is needed (confidence < 70%).
+    Files are processed sequentially (queued). Each produces an Excel file.
+    Returns JSON with download links and any warnings (e.g. multiple
+    standalone P&L pages detected).
     """
     if not files or len(files) > 2:
         raise HTTPException(400, "Please upload 1 or 2 PDF files")
 
     results = []
+
     for file in files:
         if not file.filename:
             raise HTTPException(400, "No file provided")
@@ -87,82 +84,94 @@ async def identify(files: List[UploadFile] = File(...)):
         logger.info(f"[{job_id}] Received {file.filename} ({size_mb:.1f}MB)")
 
         try:
-            result = _identify_pages(str(pdf_path), job_id)
-            result["original_filename"] = file.filename
-            results.append(result)
+            result = _run_extraction(str(pdf_path), job_id)
+            excel_path = result["excel_path"]
+            download_name = f"{Path(file.filename).stem}_financials.xlsx"
+
+            results.append({
+                "job_id": job_id,
+                "original_filename": file.filename,
+                "download_name": download_name,
+                "excel_path": excel_path,
+                "warnings": result.get("warnings", []),
+            })
         except Exception as e:
-            logger.exception(f"[{job_id}] Page identification failed")
+            logger.exception(f"[{job_id}] Extraction failed for {file.filename}")
             if pdf_path.exists():
                 pdf_path.unlink()
-            raise HTTPException(500, f"Page identification failed for {file.filename}: {str(e)}") from e
+            raise HTTPException(500, f"Extraction failed for {file.filename}: {str(e)}") from e
+        finally:
+            if pdf_path.exists():
+                pdf_path.unlink()
 
-    return JSONResponse(results)
-
-
-@app.post("/extract")
-async def extract(
-    job_id: str = Form(...),
-    confirmed_pages: str = Form(...),
-    original_filename: str = Form("report"),
-):
-    """
-    Run extraction using confirmed page numbers.
-
-    Expects job_id from a prior /identify call and user-confirmed page numbers.
-    """
-    pdf_path = UPLOAD_DIR / f"{job_id}.pdf"
-    if not pdf_path.exists():
-        raise HTTPException(400, "Session expired or invalid job_id. Please re-upload the PDF.")
-
-    try:
-        pages = json.loads(confirmed_pages)
-    except json.JSONDecodeError:
-        raise HTTPException(400, "Invalid confirmed_pages format")
-
-    logger.info(f"[{job_id}] Extracting with confirmed pages: {pages}")
-
-    try:
-        result = _run_extraction(str(pdf_path), job_id, pages)
-        excel_path = result["excel_path"]
-
-        download_name = f"{Path(original_filename).stem}_financials.xlsx"
-        return FileResponse(
-            path=excel_path,
-            filename=download_name,
+    # Single file: return Excel directly
+    if len(results) == 1:
+        r = results[0]
+        response = FileResponse(
+            path=r["excel_path"],
+            filename=r["download_name"],
             media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            headers={"X-Warnings": "|".join(r["warnings"])} if r["warnings"] else {},
         )
-    except Exception as e:
-        logger.exception(f"[{job_id}] Extraction failed")
-        raise HTTPException(500, f"Extraction failed: {str(e)}") from e
-    finally:
-        if pdf_path.exists():
-            pdf_path.unlink()
+        return response
+
+    # Multiple files: return JSON with download links + warnings
+    return JSONResponse([
+        {
+            "job_id": r["job_id"],
+            "original_filename": r["original_filename"],
+            "download_name": r["download_name"],
+            "warnings": r["warnings"],
+        }
+        for r in results
+    ])
 
 
-def _identify_pages(pdf_path: str, job_id: str) -> dict:
+@app.get("/download/{job_id}")
+async def download(job_id: str, filename: str = "report_financials.xlsx"):
+    """Download a previously generated Excel file by job_id."""
+    excel_path = UPLOAD_DIR / f"{job_id}_output.xlsx"
+    if not excel_path.exists():
+        raise HTTPException(404, "File not found or expired")
+    return FileResponse(
+        path=str(excel_path),
+        filename=filename,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
+
+
+def _run_extraction(pdf_path: str, job_id: str) -> dict:
     """
-    Run page identification, scan for P&L candidates, compute confidence.
-
-    Returns a dict with:
-      - job_id: for the subsequent /extract call
-      - recommended_pages: best-guess page numbers from Claude/regex
-      - pnl_candidates: list of all P&L candidate page numbers
-      - pnl_candidate_headers: header text for each P&L candidate page
-      - confidence: float 0.0-1.0 for P&L page identification
-      - needs_confirmation: True if confidence < 70%
-      - company_name, fy_current, fy_previous: metadata
+    Run the full extraction pipeline:
+      1. Identify standalone pages (Claude API / regex)
+      2. Scan for multiple P&L candidates and generate warnings
+      3. Docling extracts P&L from targeted page
+      4. Docling extracts note breakup from standalone notes
+      5. Generate Excel
     """
-    from app.extractor import compute_pnl_confidence, find_all_standalone_candidates
+    from app.docling_extractor import extract_note_docling, extract_pnl_docling
+    from app.excel_writer import create_excel
+    from app.extractor import (
+        compute_pnl_confidence,
+        find_all_standalone_candidates,
+        find_note_page,
+        validate_note_extraction,
+    )
     from app.extractor import find_standalone_pages as find_standalone_pages_regex
     from app.pdf_utils import extract_page_headers
 
-    pages = {}
+    excel_path = str(UPLOAD_DIR / f"{job_id}_output.xlsx")
+    warnings: list[str] = []
+
+    # ------------------------------------------------------------------
+    # Step 1: Identify standalone pages (Claude API primary, regex fallback)
+    # ------------------------------------------------------------------
     fy_current = "FY Current"
     fy_previous = "FY Previous"
+    pages = {}
     company_name = None
     claude_identified = False
 
-    # --- Claude API identification (primary) ---
     if ANTHROPIC_API_KEY:
         logger.info(f"[{job_id}] Using Claude Sonnet 4.5 to identify standalone pages")
         try:
@@ -189,7 +198,7 @@ def _identify_pages(pdf_path: str, job_id: str) -> dict:
         except Exception as e:
             logger.warning(f"[{job_id}] Claude page identification failed: {e}")
 
-    # --- Regex fallback ---
+    # Fallback: regex (only if Claude didn't find pages)
     if "pnl" not in pages:
         logger.info(f"[{job_id}] Falling back to regex page identification")
         pages, _ = find_standalone_pages_regex(pdf_path)
@@ -200,84 +209,37 @@ def _identify_pages(pdf_path: str, job_id: str) -> dict:
             "Please ensure the PDF is an annual report with standalone financial statements."
         )
 
-    # --- Scan for ALL P&L candidate pages ---
+    # ------------------------------------------------------------------
+    # Step 1b: Check for multiple standalone P&L candidates and warn
+    # ------------------------------------------------------------------
     candidates = find_all_standalone_candidates(pdf_path)
     pnl_candidates = candidates.get("pnl", [])
-    logger.info(f"[{job_id}] P&L candidates: {pnl_candidates}")
 
-    # Ensure the recommended page is always in the candidate list
     if pages["pnl"] not in pnl_candidates:
         pnl_candidates.insert(0, pages["pnl"])
 
-    # --- Compute confidence ---
     confidence = compute_pnl_confidence(len(pnl_candidates), claude_identified)
-    needs_confirmation = confidence < CONFIDENCE_THRESHOLD
-
     logger.info(f"[{job_id}] P&L confidence: {confidence:.0%} "
-                f"(candidates={len(pnl_candidates)}, claude={claude_identified}) "
-                f"-> {'PROMPT' if needs_confirmation else 'AUTO-PROCEED'}")
+                f"(candidates={len(pnl_candidates)}, claude={claude_identified})")
 
-    # --- Extract headers for P&L candidate pages (for user review) ---
-    pnl_header_map = {f"pnl_p{pg}": pg for pg in pnl_candidates}
-    raw_headers = extract_page_headers(pdf_path, pnl_header_map, num_lines=5)
-    pnl_candidate_headers = {
-        str(pg): raw_headers.get(f"pnl_p{pg}", "(no header text)")
-        for pg in pnl_candidates
-    }
-
-    return {
-        "job_id": job_id,
-        "recommended_pages": pages,
-        "pnl_candidates": pnl_candidates,
-        "pnl_candidate_headers": pnl_candidate_headers,
-        "confidence": round(confidence, 2),
-        "needs_confirmation": needs_confirmation,
-        "company_name": company_name,
-        "fy_current": fy_current,
-        "fy_previous": fy_previous,
-    }
-
-
-def _run_extraction(pdf_path: str, job_id: str, pages: dict) -> dict:
-    """
-    Run the extraction pipeline with user-confirmed pages:
-      1. Extract page headers for company validation
-      2. Docling extracts P&L from confirmed standalone page(s)
-      3. Docling extracts note breakup from standalone notes
-      4. Generate Excel
-    """
-    from app.docling_extractor import extract_note_docling, extract_pnl_docling
-    from app.excel_writer import create_excel
-    from app.extractor import find_note_page, validate_note_extraction
-    from app.pdf_utils import extract_page_headers
-
-    excel_path = str(UPLOAD_DIR / f"{job_id}_output.xlsx")
-
-    # Use metadata passed via pages dict or defaults
-    fy_current = pages.pop("fy_current", "FY Current")
-    fy_previous = pages.pop("fy_previous", "FY Previous")
-    company_name = pages.pop("company_name", None)
-
-    # Ensure page values are ints
-    for key in list(pages.keys()):
-        if pages[key] is not None:
-            pages[key] = int(pages[key])
-
-    if "pnl" not in pages:
-        raise ValueError(
-            "Could not find Standalone P&L page. "
-            "Please ensure the PDF is an annual report with standalone financial statements."
+    if len(pnl_candidates) > 1:
+        candidate_pages_display = ", ".join(str(p + 1) for p in pnl_candidates)
+        warnings.append(
+            f"Multiple standalone P&L pages detected (PDF pages: {candidate_pages_display}). "
+            f"Extracted from page {pages['pnl'] + 1}. "
+            f"Please verify the totals in the Validation sheet to ensure the correct page was used."
         )
+        logger.warning(f"[{job_id}] {warnings[-1]}")
 
     # ------------------------------------------------------------------
-    # Step 1: Extract page headers for validation
+    # Step 2: Extract page headers for validation
     # ------------------------------------------------------------------
     page_headers = extract_page_headers(pdf_path, pages)
     logger.info(f"[{job_id}] Extracted headers from standalone pages: "
                 f"{list(page_headers.keys())}")
 
     # ------------------------------------------------------------------
-    # Step 2: Docling extracts P&L from targeted standalone page(s)
+    # Step 3: Docling extracts P&L from targeted standalone page(s)
     # ------------------------------------------------------------------
     logger.info(f"[{job_id}] Docling extracting P&L from standalone page {pages['pnl']}")
     pnl = extract_pnl_docling(pdf_path, pages["pnl"])
@@ -295,7 +257,7 @@ def _run_extraction(pdf_path: str, job_id: str, pages: dict) -> dict:
                 f"{list(pnl['items'].keys())}")
 
     # ------------------------------------------------------------------
-    # Step 3: Docling extracts note breakup from standalone notes
+    # Step 4: Docling extracts note breakup from standalone notes
     # ------------------------------------------------------------------
     note_items = []
     note_total = None
@@ -323,16 +285,21 @@ def _run_extraction(pdf_path: str, job_id: str, pages: dict) -> dict:
         logger.warning(f"[{job_id}] No note reference found for Other expenses in P&L")
 
     # ------------------------------------------------------------------
-    # Step 3b: Validate note extraction against P&L
+    # Step 4b: Validate note extraction against P&L
     # ------------------------------------------------------------------
     validation = validate_note_extraction(pnl, note_items, note_total, note_num)
     for check in validation:
         status = "PASS" if check["ok"] else "FAIL"
         logger.info(f"[{job_id}] Validation: {check['name']} -> {status} "
                      f"(got {check['actual']:.2f}, expected {check['expected']:.2f})")
+        if not check["ok"]:
+            warnings.append(
+                f"Validation FAIL: {check['name']} "
+                f"(got {check['actual']:.2f}, expected {check['expected']:.2f})"
+            )
 
     # ------------------------------------------------------------------
-    # Step 4: Generate Excel with header validation
+    # Step 5: Generate Excel with header validation
     # ------------------------------------------------------------------
     data = {
         "company": pnl["company"],
@@ -346,12 +313,13 @@ def _run_extraction(pdf_path: str, job_id: str, pages: dict) -> dict:
         "note_number": note_num,
         "note_validation": validation,
         "page_headers": page_headers,
+        "warnings": warnings,
     }
 
     create_excel(data, excel_path)
     logger.info(f"[{job_id}] Excel generated: {excel_path}")
 
-    return {"excel_path": excel_path, "data": data}
+    return {"excel_path": excel_path, "data": data, "warnings": warnings}
 
 
 if __name__ == "__main__":
