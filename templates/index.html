@@ -52,27 +52,6 @@
                 {% endif %}
             </div>
 
-            <!-- Confirmation dialog for low-confidence P&L page -->
-            <div class="confirm-section" id="confirmSection" style="display:none;">
-                <div class="confirm-card">
-                    <div class="confirm-header-row">
-                        <h2 class="confirm-title">Confirm Standalone P&L Page</h2>
-                        <span class="confirm-confidence" id="confirmConfidence"></span>
-                    </div>
-                    <p class="confirm-desc" id="confirmDesc"></p>
-
-                    <div class="confirm-group" id="confirmPnlGroup">
-                        <h3 class="confirm-group-title">Statement of Profit & Loss</h3>
-                        <div id="confirmPnlOptions"></div>
-                    </div>
-
-                    <div class="confirm-actions">
-                        <button class="btn-secondary" id="confirmCancelBtn">Cancel</button>
-                        <button class="btn-extract" id="confirmExtractBtn">Confirm & Extract</button>
-                    </div>
-                </div>
-            </div>
-
             <div class="processing-section" id="processingSection" style="display:none;">
                 <div class="spinner"></div>
                 <p class="processing-text" id="processingText">Uploading PDF...</p>
@@ -99,6 +78,13 @@
                 </div>
             </div>
 
+            <!-- Warning banner shown after extraction completes -->
+            <div class="warning-banner" id="warningBanner" style="display:none;">
+                <div class="warning-banner-title">Review Required</div>
+                <ul class="warning-banner-list" id="warningList"></ul>
+                <button class="btn-secondary" id="warningDismissBtn">OK, Got It</button>
+            </div>
+
             <div class="error-section" id="errorSection" style="display:none;">
                 <div class="error-icon">!</div>
                 <p class="error-text" id="errorText"></p>
@@ -117,25 +103,18 @@
         const fileList = document.getElementById('fileList');
         const extractBtn = document.getElementById('extractBtn');
         const uploadSection = document.getElementById('uploadSection');
-        const confirmSection = document.getElementById('confirmSection');
-        const confirmConfidence = document.getElementById('confirmConfidence');
-        const confirmDesc = document.getElementById('confirmDesc');
-        const confirmPnlOptions = document.getElementById('confirmPnlOptions');
-        const confirmCancelBtn = document.getElementById('confirmCancelBtn');
-        const confirmExtractBtn = document.getElementById('confirmExtractBtn');
         const processingSection = document.getElementById('processingSection');
         const processingText = document.getElementById('processingText');
         const queueStatus = document.getElementById('queueStatus');
         const queueLabel = document.getElementById('queueLabel');
+        const warningBanner = document.getElementById('warningBanner');
+        const warningList = document.getElementById('warningList');
+        const warningDismissBtn = document.getElementById('warningDismissBtn');
         const errorSection = document.getElementById('errorSection');
         const errorText = document.getElementById('errorText');
         const retryBtn = document.getElementById('retryBtn');
 
         let selectedFiles = [];
-        // Array of identify results (one per file) from /identify
-        let identifyResults = [];
-        // Index into identifyResults for the report currently being processed
-        let currentReportIdx = 0;
 
         // Drag & drop
         dropZone.addEventListener('click', () => fileInput.click());
@@ -179,7 +158,6 @@
                 `;
                 fileList.appendChild(row);
             });
-            // Bind remove buttons
             fileList.querySelectorAll('.btn-clear').forEach(btn => {
                 btn.addEventListener('click', (e) => {
                     const idx = parseInt(e.target.dataset.idx);
@@ -195,8 +173,6 @@
 
         function resetUpload() {
             selectedFiles = [];
-            identifyResults = [];
-            currentReportIdx = 0;
             fileInput.value = '';
             fileList.style.display = 'none';
             fileList.innerHTML = '';
@@ -210,12 +186,13 @@
             return (bytes / 1048576).toFixed(1) + ' MB';
         }
 
-        // ---- Main flow: Upload & Identify all files, then process queue ----
+        // ---- Extract flow ----
         extractBtn.addEventListener('click', async () => {
             if (selectedFiles.length === 0) return;
 
             uploadSection.style.display = 'none';
             errorSection.style.display = 'none';
+            warningBanner.style.display = 'none';
             processingSection.style.display = 'flex';
             updateStep(1);
             processingText.textContent = 'Uploading PDF' + (selectedFiles.length > 1 ? 's' : '') + '...';
@@ -225,196 +202,97 @@
 
             try {
                 updateStep(2);
-                processingText.textContent = 'Identifying standalone P&L sections...';
+                processingText.textContent = 'Identifying standalone sections...';
 
-                const response = await fetch('/identify', {
+                updateStep(3);
+                processingText.textContent = 'Extracting data...';
+
+                const response = await fetch('/extract', {
                     method: 'POST',
                     body: formData,
                 });
 
                 if (!response.ok) {
                     const err = await response.json();
-                    throw new Error(err.detail || 'Page identification failed');
+                    throw new Error(err.detail || 'Extraction failed');
                 }
 
-                identifyResults = await response.json();
-                currentReportIdx = 0;
+                updateStep(4);
+                processingText.textContent = 'Download ready!';
 
-                // Process the queue one report at a time
-                await processNextReport();
+                const contentType = response.headers.get('content-type') || '';
+                let allWarnings = [];
 
-            } catch (err) {
+                if (contentType.includes('application/json')) {
+                    // Multi-file: JSON with download links
+                    const results = await response.json();
+                    for (const r of results) {
+                        allWarnings.push(...(r.warnings || []));
+                        // Download each file
+                        const dlUrl = `/download/${r.job_id}?filename=${encodeURIComponent(r.download_name)}`;
+                        await downloadFile(dlUrl, r.download_name);
+                    }
+                } else {
+                    // Single file: direct download
+                    const warningsHeader = response.headers.get('X-Warnings');
+                    if (warningsHeader) {
+                        allWarnings = warningsHeader.split('|').filter(w => w.trim());
+                    }
+                    const blob = await response.blob();
+                    const url = URL.createObjectURL(blob);
+                    const fname = selectedFiles[0].name.replace(/\.pdf$/i, '_financials.xlsx');
+                    triggerDownload(url, fname);
+                    URL.revokeObjectURL(url);
+                }
+
                 processingSection.style.display = 'none';
-                showError(err.message);
-            }
-        });
 
-        async function processNextReport() {
-            if (currentReportIdx >= identifyResults.length) {
-                // All done
-                setTimeout(() => {
-                    processingSection.style.display = 'none';
+                if (allWarnings.length > 0) {
+                    showWarnings(allWarnings);
+                } else {
                     uploadSection.style.display = 'block';
                     resetUpload();
-                }, 2000);
-                return;
-            }
-
-            const result = identifyResults[currentReportIdx];
-            const total = identifyResults.length;
-
-            if (total > 1) {
-                queueStatus.style.display = 'block';
-                queueLabel.textContent = `Report ${currentReportIdx + 1} of ${total}: ${result.original_filename}`;
-            }
-
-            if (result.needs_confirmation) {
-                // Show P&L confirmation dialog
-                processingSection.style.display = 'none';
-                showPnlConfirmation(result);
-            } else {
-                // Auto-proceed with recommended pages
-                await runExtraction(result, result.recommended_pages);
-            }
-        }
-
-        // ---- P&L Confirmation Dialog ----
-        function showPnlConfirmation(result) {
-            confirmPnlOptions.innerHTML = '';
-
-            const pct = Math.round(result.confidence * 100);
-            confirmConfidence.textContent = pct + '% confidence';
-            confirmConfidence.className = 'confirm-confidence' + (pct < 50 ? ' low' : ' medium');
-
-            const fname = result.original_filename || 'this report';
-            confirmDesc.textContent = `Multiple standalone P&L pages detected in "${fname}". ` +
-                'Please select the correct page before extraction. Page headers are shown to help identify the right one.';
-
-            const recommended = result.recommended_pages.pnl;
-
-            for (const pageNum of result.pnl_candidates) {
-                const isRecommended = (pageNum === recommended);
-                const optionDiv = document.createElement('label');
-                optionDiv.className = 'confirm-option' + (isRecommended ? ' recommended' : '');
-
-                const radio = document.createElement('input');
-                radio.type = 'radio';
-                radio.name = 'pnl_page';
-                radio.value = pageNum;
-                if (isRecommended) radio.checked = true;
-
-                const details = document.createElement('div');
-                details.className = 'confirm-option-details';
-
-                const pageLabelEl = document.createElement('div');
-                pageLabelEl.className = 'confirm-option-page';
-                pageLabelEl.textContent = 'PDF Page ' + (pageNum + 1);
-                if (isRecommended) {
-                    const recTag = document.createElement('span');
-                    recTag.className = 'confirm-recommended-tag';
-                    recTag.textContent = 'Recommended';
-                    pageLabelEl.appendChild(recTag);
                 }
 
-                const headerText = document.createElement('pre');
-                headerText.className = 'confirm-option-header';
-                headerText.textContent = result.pnl_candidate_headers[String(pageNum)] || '(no header text)';
-
-                details.appendChild(pageLabelEl);
-                details.appendChild(headerText);
-                optionDiv.appendChild(radio);
-                optionDiv.appendChild(details);
-                confirmPnlOptions.appendChild(optionDiv);
-            }
-
-            confirmSection.style.display = 'block';
-        }
-
-        confirmCancelBtn.addEventListener('click', () => {
-            confirmSection.style.display = 'none';
-            uploadSection.style.display = 'block';
-            resetUpload();
-        });
-
-        confirmExtractBtn.addEventListener('click', async () => {
-            const radio = document.querySelector('input[name="pnl_page"]:checked');
-            if (!radio) {
-                showError('Please select a P&L page');
-                return;
-            }
-
-            const result = identifyResults[currentReportIdx];
-            const confirmedPages = { ...result.recommended_pages };
-            confirmedPages.pnl = parseInt(radio.value);
-
-            confirmSection.style.display = 'none';
-            processingSection.style.display = 'flex';
-
-            try {
-                await runExtraction(result, confirmedPages);
             } catch (err) {
                 processingSection.style.display = 'none';
                 showError(err.message);
             }
         });
 
-        // ---- Extraction for a single report ----
-        async function runExtraction(result, confirmedPages) {
-            updateStep(3);
-            processingText.textContent = 'Extracting data from P&L page...';
+        async function downloadFile(url, filename) {
+            const resp = await fetch(url);
+            if (!resp.ok) return;
+            const blob = await resp.blob();
+            const blobUrl = URL.createObjectURL(blob);
+            triggerDownload(blobUrl, filename);
+            URL.revokeObjectURL(blobUrl);
+        }
 
-            const pagesWithMeta = {
-                ...confirmedPages,
-                fy_current: result.fy_current,
-                fy_previous: result.fy_previous,
-                company_name: result.company_name,
-            };
-
-            const formData = new FormData();
-            formData.append('job_id', result.job_id);
-            formData.append('confirmed_pages', JSON.stringify(pagesWithMeta));
-            formData.append('original_filename', result.original_filename || 'report');
-
-            const response = await fetch('/extract', {
-                method: 'POST',
-                body: formData,
-            });
-
-            if (!response.ok) {
-                const err = await response.json();
-                throw new Error(err.detail || 'Extraction failed');
-            }
-
-            updateStep(4);
-            processingText.textContent = 'Download ready!';
-
-            // Download the file
-            const blob = await response.blob();
-            const url = URL.createObjectURL(blob);
+        function triggerDownload(url, filename) {
             const a = document.createElement('a');
             a.href = url;
-            const origName = result.original_filename || 'report.pdf';
-            a.download = origName.replace('.pdf', '_financials.xlsx').replace('.PDF', '_financials.xlsx');
+            a.download = filename;
             document.body.appendChild(a);
             a.click();
             document.body.removeChild(a);
-            URL.revokeObjectURL(url);
-
-            // Move to next report in queue
-            currentReportIdx++;
-            if (currentReportIdx < identifyResults.length) {
-                updateStep(1);
-                processingText.textContent = 'Starting next report...';
-                setTimeout(() => processNextReport(), 1000);
-            } else {
-                processingText.textContent = 'All reports processed!';
-                setTimeout(() => {
-                    processingSection.style.display = 'none';
-                    uploadSection.style.display = 'block';
-                    resetUpload();
-                }, 2000);
-            }
         }
+
+        function showWarnings(warnings) {
+            warningList.innerHTML = '';
+            for (const w of warnings) {
+                const li = document.createElement('li');
+                li.textContent = w;
+                warningList.appendChild(li);
+            }
+            warningBanner.style.display = 'block';
+        }
+
+        warningDismissBtn.addEventListener('click', () => {
+            warningBanner.style.display = 'none';
+            uploadSection.style.display = 'block';
+            resetUpload();
+        });
 
         function updateStep(n) {
             for (let i = 1; i <= 4; i++) {
@@ -425,8 +303,8 @@
         }
 
         function showError(msg) {
-            confirmSection.style.display = 'none';
             processingSection.style.display = 'none';
+            warningBanner.style.display = 'none';
             errorSection.style.display = 'flex';
             errorText.textContent = msg;
         }
