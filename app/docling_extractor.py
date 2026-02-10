@@ -576,6 +576,200 @@ def _extract_note_from_text(pdf_path: str, note_page: int,
 
 
 # -------------------------------------------------------------------
+# Note item extraction helpers
+# -------------------------------------------------------------------
+
+def _extract_note_items_from_df(df, note_number: str) -> tuple[list[dict], dict | None]:
+    """
+    Extract note items from a single DataFrame table.
+
+    This is the standard targeted extraction: it identifies value columns,
+    skips header/heading rows, and pulls label + values for each line item.
+    """
+    label_col, curr_col, prev_col = _identify_value_columns_df(df)
+    note_esc = re.escape(note_number)
+
+    note_items = []
+    for _, row in df.iterrows():
+        ncols = len(row)
+        if ncols <= label_col:
+            continue
+        label = str(row.iloc[label_col] or '').strip()
+        if not label:
+            continue
+        label_lower = label.lower()
+        if any(skip in label_lower for skip in [
+            'for the year', 'march 31', 'particulars', 'in \u20b9',
+            'in rs', 'in inr', 'in million', 'in lakhs', 'in crore',
+        ]):
+            continue
+        # Skip the note heading row itself (e.g. "27. Other expenses")
+        if re.match(rf'^\s*{note_esc}\s*[.\-–—:)]', label, re.IGNORECASE):
+            continue
+        # Skip rows that are just the keyword header
+        if label_lower in ('other expenses', 'other expense'):
+            continue
+
+        curr_val = _parse_number(row.iloc[curr_col]) if 0 <= curr_col < ncols else None
+        prev_val = _parse_number(row.iloc[prev_col]) if 0 <= prev_col < ncols else None
+
+        if curr_val is not None:
+            note_items.append({
+                'label': label,
+                'current': curr_val,
+                'previous': prev_val if prev_val is not None else 0.0,
+            })
+
+    total_item = _find_total_item(note_items)
+    return note_items, total_item
+
+
+def _extract_note_section_from_combined_table(
+    df, note_number: str
+) -> tuple[list[dict], dict | None]:
+    """
+    Extract items for a specific note from a combined table containing
+    multiple notes (e.g. notes 19-25 all in one big table).
+
+    Strategy: scan rows for the note heading (e.g. "21. Other expenses"),
+    then collect rows until the next note heading or end of table.
+    """
+    label_col, curr_col, prev_col = _identify_value_columns_df(df)
+    note_esc = re.escape(note_number)
+
+    # 1. Find the row with the note heading
+    note_heading_re = re.compile(
+        rf'^\s*{note_esc}\s*[.\-–—:)]\s', re.IGNORECASE
+    )
+    # Also match heading like "Other expenses" on its own row near the note number
+    next_note_re = re.compile(r'^\s*(\d{1,2})\s*[.\-–—:)]\s', re.IGNORECASE)
+
+    start_idx = None
+    for row_idx, (_, row) in enumerate(df.iterrows()):
+        ncols = len(row)
+        if ncols <= label_col:
+            continue
+        label = str(row.iloc[label_col] or '').strip()
+        if note_heading_re.match(label):
+            start_idx = row_idx + 1
+            break
+        # Also check if cell contains the note number as a standalone value
+        # (some tables have note number in a separate column)
+        for c in range(ncols):
+            cell = str(row.iloc[c] or '').strip()
+            if cell == note_number and 'expense' in str(row.values).lower():
+                start_idx = row_idx + 1
+                break
+        if start_idx is not None:
+            break
+
+    if start_idx is None:
+        return [], None
+
+    # 2. Collect rows from start_idx until next note heading or table end
+    note_items = []
+    rows_list = list(df.iterrows())
+
+    for row_idx in range(start_idx, len(rows_list)):
+        _, row = rows_list[row_idx]
+        ncols = len(row)
+        if ncols <= label_col:
+            continue
+        label = str(row.iloc[label_col] or '').strip()
+        if not label:
+            continue
+
+        # Stop if we hit the next note heading
+        m = next_note_re.match(label)
+        if m and m.group(1) != note_number:
+            break
+
+        label_lower = label.lower()
+        # Skip sub-headers
+        if any(skip in label_lower for skip in [
+            'for the year', 'march 31', 'particulars',
+            'in \u20b9', 'in rs', 'in inr', 'in million', 'in lakhs',
+        ]):
+            continue
+
+        curr_val = _parse_number(row.iloc[curr_col]) if 0 <= curr_col < ncols else None
+        prev_val = _parse_number(row.iloc[prev_col]) if 0 <= prev_col < ncols else None
+
+        if curr_val is not None:
+            note_items.append({
+                'label': label,
+                'current': curr_val,
+                'previous': prev_val if prev_val is not None else 0.0,
+            })
+
+    total_item = _find_total_item(note_items)
+    return note_items, total_item
+
+
+def _extract_all_expense_rows_from_df(df) -> tuple[list[dict], dict | None]:
+    """
+    Last-resort fallback: extract ALL rows with expense-like labels and
+    numeric values from a table, regardless of note structure.
+
+    This handles the case where the note has no heading and is part of
+    a big table. The user accepts getting extra rows if it means not
+    getting empty results.
+    """
+    label_col, curr_col, prev_col = _identify_value_columns_df(df)
+
+    # Check if this table has expense-related content
+    text = ' '.join(str(v).lower() for v in df.values.flatten() if v is not None)
+    expense_hits = sum(1 for kw in _NOTE_EXPENSE_KEYWORDS if kw in text)
+    if expense_hits < 2:
+        return [], None
+
+    note_items = []
+    for _, row in df.iterrows():
+        ncols = len(row)
+        if ncols <= label_col:
+            continue
+        label = str(row.iloc[label_col] or '').strip()
+        if not label:
+            continue
+        label_lower = label.lower()
+
+        # Skip headers/meta rows
+        if any(skip in label_lower for skip in [
+            'for the year', 'march 31', 'particulars',
+            'in \u20b9', 'in rs', 'in inr', 'in million', 'in lakhs', 'in crore',
+            'note', 'sr.', 'sl.',
+        ]):
+            continue
+
+        # Must contain alphabetic chars (not just numbers)
+        if not any(c.isalpha() for c in label):
+            continue
+
+        curr_val = _parse_number(row.iloc[curr_col]) if 0 <= curr_col < ncols else None
+        prev_val = _parse_number(row.iloc[prev_col]) if 0 <= prev_col < ncols else None
+
+        if curr_val is not None:
+            note_items.append({
+                'label': label,
+                'current': curr_val,
+                'previous': prev_val if prev_val is not None else 0.0,
+            })
+
+    total_item = _find_total_item(note_items)
+    return note_items, total_item
+
+
+def _find_total_item(note_items: list[dict]) -> dict | None:
+    """Find the total row from a list of note items."""
+    for item in reversed(note_items):
+        if 'total' in item['label'].lower():
+            return item
+    if note_items:
+        return note_items[-1]
+    return None
+
+
+# -------------------------------------------------------------------
 # Public API: Note breakup extraction
 # -------------------------------------------------------------------
 
@@ -634,55 +828,53 @@ def extract_note_docling(pdf_path: str, note_page: int,
         logger.info(f"Note table: {len(note_table)} rows x "
                      f"{len(note_table.columns)} cols (table idx={idx})")
 
-        # Identify columns
-        label_col, curr_col, prev_col = _identify_value_columns_df(note_table)
-
-        # Extract items
-        note_esc = re.escape(note_number)
-        note_items = []
-        for _, row in note_table.iterrows():
-            ncols = len(row)
-            if ncols <= label_col:
-                continue
-            label = str(row.iloc[label_col] or '').strip()
-            if not label:
-                continue
-            label_lower = label.lower()
-            if any(skip in label_lower for skip in [
-                'for the year', 'march 31', 'particulars', 'in \u20b9',
-                'in rs', 'in inr', 'in million', 'in lakhs', 'in crore',
-            ]):
-                continue
-            # Skip the note heading row itself (e.g. "27. Other expenses")
-            if re.match(rf'^\s*{note_esc}\s*[.\-–—:)]', label, re.IGNORECASE):
-                continue
-            # Skip rows that are just the keyword header
-            if label_lower in ('other expenses', 'other expense'):
-                continue
-
-            curr_val = _parse_number(row.iloc[curr_col]) if 0 <= curr_col < ncols else None
-            prev_val = _parse_number(row.iloc[prev_col]) if 0 <= prev_col < ncols else None
-
-            if curr_val is not None:
-                note_items.append({
-                    'label': label,
-                    'current': curr_val,
-                    'previous': prev_val if prev_val is not None else 0.0,
-                })
-
-        # Identify total row
-        total_item = None
-        for item in reversed(note_items):
-            if 'total' in item['label'].lower():
-                total_item = item
-                break
-        if total_item is None and note_items:
-            total_item = note_items[-1]
+        # Try targeted extraction from the best matching table
+        note_items, total_item = _extract_note_items_from_df(
+            note_table, note_number
+        )
 
         logger.info(f"Docling extracted {len(note_items)} note items")
 
-        # If Docling extracted very few items, try text fallback as supplement
-        if len(note_items) < 3:
+        # -----------------------------------------------------------------
+        # Fallback 1: if targeted extraction returned empty, the note may
+        # be part of a larger combined table. Try extracting the note
+        # section from ALL tables on these pages.
+        # -----------------------------------------------------------------
+        if len(note_items) < 2:
+            logger.info("Targeted extraction returned few items, "
+                        "trying combined-table extraction from all tables")
+            for t_idx, df in enumerate(tables):
+                if t_idx == idx:
+                    continue  # already tried this one
+                fb_items, fb_total = _extract_note_section_from_combined_table(
+                    df, note_number
+                )
+                if len(fb_items) > len(note_items):
+                    logger.info(f"Combined-table extraction found "
+                                f"{len(fb_items)} items in table {t_idx}")
+                    note_items = fb_items
+                    total_item = fb_total
+                    break
+
+        # -----------------------------------------------------------------
+        # Fallback 2: if still empty, extract entire table as-is
+        # (the user said this is acceptable when targeted extraction fails)
+        # -----------------------------------------------------------------
+        if len(note_items) < 2:
+            logger.info("Combined-table extraction also failed, "
+                        "extracting all expense-like rows from all tables")
+            for df in tables:
+                fb_items, fb_total = _extract_all_expense_rows_from_df(df)
+                if len(fb_items) > len(note_items):
+                    logger.info(f"Full-table fallback found {len(fb_items)} items")
+                    note_items = fb_items
+                    total_item = fb_total
+                    break
+
+        # -----------------------------------------------------------------
+        # Fallback 3: text-based extraction
+        # -----------------------------------------------------------------
+        if len(note_items) < 2:
             logger.info("Docling extracted few note items, trying text fallback")
             text_items, text_total = _extract_note_from_text(
                 pdf_path, note_page, note_number
