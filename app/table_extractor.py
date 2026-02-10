@@ -434,7 +434,7 @@ def find_standalone_pages(pdf_path: str) -> tuple[dict, int]:
     Falls back to matching without "standalone" for single-entity reports
     that have no consolidated section.
     """
-    from app.extractor import _has_consolidated_section, _has_pnl_title
+    from app.extractor import _has_consolidated_section, _has_pnl_title, _is_likely_toc_page
 
     doc = fitz.open(pdf_path)
     pages = {}
@@ -443,6 +443,8 @@ def find_standalone_pages(pdf_path: str) -> tuple[dict, int]:
     # Pass 1: explicitly labelled "standalone" pages
     for i in range(total):
         text = doc[i].get_text()
+        if _is_likely_toc_page(text):
+            continue
         lower = text.lower()
 
         if _has_pnl_title(lower) and 'standalone' in lower and 'pnl' not in pages:
@@ -456,6 +458,8 @@ def find_standalone_pages(pdf_path: str) -> tuple[dict, int]:
     if 'pnl' not in pages and not _has_consolidated_section(doc):
         for i in range(total):
             text = doc[i].get_text()
+            if _is_likely_toc_page(text):
+                continue
             lower = text.lower()
             if _has_pnl_title(lower) and 'pnl' not in pages:
                 pages['pnl'] = i

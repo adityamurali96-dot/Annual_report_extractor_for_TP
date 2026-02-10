@@ -42,6 +42,39 @@ def _has_pnl_title(text_lower: str) -> bool:
     return any(pattern.search(normalised) for pattern in _PNL_TITLE_REGEXES)
 
 
+def _is_likely_toc_page(text: str) -> bool:
+    """Heuristic check for table-of-contents/summary pages.
+
+    TOC pages often contain many short lines that end with integer page
+    numbers/ranges (e.g. "Balance Sheet 51", "Notes ... 54-76").
+    These pages can mention all statement names and otherwise look like
+    valid targets, so we explicitly filter them out.
+    """
+    lines = [l.strip() for l in text.split('\n') if l.strip()]
+    if not lines:
+        return False
+
+    joined_header = ' '.join(lines[:8]).lower()
+    if any(marker in joined_header for marker in ('table of contents', 'contents', 'index')):
+        return True
+
+    toc_entry_pattern = re.compile(
+        r"^.*[A-Za-z].*(?:\.{2,}|\s)\d{1,3}(?:\s*-\s*\d{1,3})?$"
+    )
+    toc_like = 0
+    for line in lines[:50]:
+        # Skip normal financial value rows (usually include commas/decimals).
+        if ',' in line or re.search(r'\d+\.\d+', line):
+            continue
+        if toc_entry_pattern.match(line):
+            toc_like += 1
+
+    sample_size = min(len(lines), 50)
+
+    # Require both absolute and relative density to avoid false positives.
+    return toc_like >= 4 and (toc_like / max(sample_size, 1)) >= 0.20
+
+
 def _has_consolidated_section(doc) -> bool:
     """Check if the PDF contains actual consolidated financial statement pages.
 
@@ -51,6 +84,8 @@ def _has_consolidated_section(doc) -> bool:
     """
     for i in range(doc.page_count):
         text = doc[i].get_text()
+        if _is_likely_toc_page(text):
+            continue
         # Only look at the first ~10 lines (page header/title area)
         header = '\n'.join(text.split('\n')[:10]).lower()
         if 'consolidated' in header and (
@@ -75,6 +110,8 @@ def find_standalone_pages(pdf_path: str) -> tuple[dict, int]:
     # --- Pass 1: look for explicitly labelled "standalone" pages ---
     for i in range(doc.page_count):
         text = doc[i].get_text()
+        if _is_likely_toc_page(text):
+            continue
         lower = text.lower()
         if _has_pnl_title(lower) and 'standalone' in lower and 'pnl' not in pages:
             pages['pnl'] = i
@@ -87,6 +124,8 @@ def find_standalone_pages(pdf_path: str) -> tuple[dict, int]:
     if 'pnl' not in pages and not _has_consolidated_section(doc):
         for i in range(doc.page_count):
             text = doc[i].get_text()
+            if _is_likely_toc_page(text):
+                continue
             lower = text.lower()
             if _has_pnl_title(lower) and 'pnl' not in pages:
                 pages['pnl'] = i
@@ -124,6 +163,8 @@ def find_all_standalone_candidates(pdf_path: str) -> dict[str, list[int]]:
 
     for i in range(doc.page_count):
         text = doc[i].get_text()
+        if _is_likely_toc_page(text):
+            continue
         lower = text.lower()
 
         if _has_pnl_title(lower):
