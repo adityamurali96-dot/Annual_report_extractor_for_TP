@@ -188,6 +188,8 @@ PNL_ITEMS = {
     'Profit for the year': ['profit for the year', 'profit for the period',
                              'profit / (loss) for the year',
                              'profit/(loss) for the year',
+                             'profit/(loss) for the period',
+                             'profit / (loss) for the period',
                              'net profit for the year'],
     'Total comprehensive income': ['total comprehensive income',
                                     'total comprehensive income / (loss)'],

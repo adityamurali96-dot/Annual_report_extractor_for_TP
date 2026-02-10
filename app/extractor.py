@@ -18,6 +18,8 @@ _PNL_TITLE_PATTERNS = [
     'statement of profit and loss',
     'profit and loss account',
     'profit and loss statement',
+    'profit & loss account',
+    'profit & loss statement',
 ]
 
 
@@ -27,18 +29,20 @@ def _has_pnl_title(text_lower: str) -> bool:
 
 
 def _has_consolidated_section(doc) -> bool:
-    """Check if the PDF contains consolidated financial statements.
+    """Check if the PDF contains actual consolidated financial statement pages.
 
-    If it does, standalone and consolidated sections coexist and we must
-    distinguish between them.  If it doesn't, the report is a single-entity
-    report and every financial statement is implicitly standalone.
+    Only checks page headers (first ~10 lines) so that incidental mentions
+    of 'consolidated' in notes, table of contents, or director's report
+    don't cause false positives.
     """
     for i in range(doc.page_count):
-        text = doc[i].get_text().lower()
-        if 'consolidated' in text and (
-            _has_pnl_title(text)
-            or 'balance sheet' in text
-            or 'cash flow' in text
+        text = doc[i].get_text()
+        # Only look at the first ~10 lines (page header/title area)
+        header = '\n'.join(text.split('\n')[:10]).lower()
+        if 'consolidated' in header and (
+            _has_pnl_title(header)
+            or 'balance sheet' in header
+            or 'cash flow' in header
         ):
             return True
     return False
