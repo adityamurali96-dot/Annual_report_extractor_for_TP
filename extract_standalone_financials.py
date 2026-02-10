@@ -135,9 +135,10 @@ def run_extraction(pdf_path: str, output_path: str):
         print(f"    {k:42s} | CY: {v['current']:>14,.2f} | PY: {v['previous']:>14,.2f}")
 
     # ==================================================================
-    # STAGE 4: Docling extracts note breakup from standalone notes
+    # STAGE 4: Docling extracts note breakup from notes section
     # ==================================================================
-    print("\nSTAGE 4: Docling - Extract Other Expenses Note")
+    oe_label = pnl.get("operating_expense_label", "Other expenses")
+    print(f"\nSTAGE 4: Docling - Extract {oe_label} Note")
 
     note_num = pnl["note_refs"].get("Other expenses")
     note_items = []
@@ -145,8 +146,8 @@ def run_extraction(pdf_path: str, output_path: str):
     search_start = pages.get("notes_start", pages["pnl"])
 
     if note_num:
-        print(f"  Note reference for Other expenses: {note_num}")
-        note_page, _ = find_note_page(pdf_path, note_num, search_start, "Other expenses")
+        print(f"  Note reference for {oe_label}: {note_num}")
+        note_page, _ = find_note_page(pdf_path, note_num, search_start, oe_label)
 
         if note_page is not None:
             print(f"  Extracting Note {note_num} from page {note_page}...")

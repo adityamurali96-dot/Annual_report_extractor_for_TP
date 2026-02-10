@@ -73,11 +73,19 @@ def _create_page_subset_pdf(pdf_path: str, page_indices: list[int]) -> str:
 # -------------------------------------------------------------------
 
 def _parse_number(s) -> float | None:
-    """Parse a number from a table cell, handling commas, parens, dashes."""
+    """Parse a number from a table cell, handling commas, parens, dashes.
+
+    Returns None for truly empty cells (no data).
+    Returns 0.0 for explicit zero markers (dash, Nil).
+    """
     if s is None:
         return None
     s = str(s).strip()
-    if s in ['-', '', 'None', 'nan', '\u2014', '\u2013', 'Nil', 'nil', '- ', '\u2012']:
+    # Truly empty — means "no data", not zero
+    if s in ['', 'None', 'nan']:
+        return None
+    # Explicit zero markers — means zero
+    if s in ['-', '\u2014', '\u2013', 'Nil', 'nil', '- ', '\u2012']:
         return 0.0
     s = s.replace(',', '').replace(' ', '').replace('\u00a0', '')
     neg = s.startswith('(') and s.endswith(')')
@@ -158,6 +166,8 @@ PNL_ITEMS = {
     'Total income': ['total income', 'total revenue'],
     'Employee benefits expense': ['employee benefits expense', 'employee benefit expense',
                                    'employee cost'],
+    'Cost of materials consumed': ['cost of materials consumed', 'cost of materials',
+                                    'cost of goods sold'],
     'Cost of professionals': ['cost of professionals', 'subcontracting expense',
                                'cost of services'],
     'Finance costs': ['finance costs', 'finance cost', 'interest expense'],
@@ -165,7 +175,9 @@ PNL_ITEMS = {
                                        'depreciation and amortization',
                                        'depreciation & amortisation',
                                        'depreciation & amortization'],
-    'Other expenses': ['other expenses', 'other expense'],
+    'Other expenses': ['other expenses', 'other expense',
+                       'administrative charges', 'administrative expenses',
+                       'administrative expense'],
     'Total expenses': ['total expenses', 'total expense'],
     'Profit before tax': ['profit before exceptional', 'profit before tax',
                            'profit / (loss) before tax',
@@ -199,14 +211,49 @@ def _match_pnl_item(label: str, item_name: str, patterns: list[str]) -> bool:
 # DataFrame-based table processing
 # -------------------------------------------------------------------
 
+_ROMAN_RE = re.compile(r'^[IVXLCDM]{1,6}$', re.IGNORECASE)
+
+
+def _is_serial_column(df, col_idx: int) -> bool:
+    """Check if a column contains serial numbers or roman numerals.
+
+    Some P&L tables have a serial/roman numeral column before the label
+    column (e.g. I, II, III, IV or 1, 2, 3). This detects such columns
+    so they can be skipped when identifying the label column.
+    """
+    values = [str(row.iloc[col_idx] or '').strip() for _, row in df.iterrows()]
+    non_empty = [v for v in values if v and v not in ('None', 'nan', '')]
+    if not non_empty:
+        return False
+
+    serial_count = sum(
+        1 for v in non_empty
+        if (
+            _ROMAN_RE.match(v)             # Roman numerals: I, II, IV, XIV
+            or re.match(r'^\d{1,3}$', v)   # Numeric: 1, 2, 15
+            or re.match(r'^[a-zA-Z]$', v)  # Single letter: a, b, c
+            or re.match(r'^\(\d{1,2}\)$', v)  # Parenthesized: (1), (2)
+        )
+    )
+    return serial_count / len(non_empty) > 0.5
+
+
 def _identify_value_columns_df(df) -> tuple[int, int, int]:
     """
     Identify label column and two value columns from a DataFrame.
     Returns (label_col, current_year_col, previous_year_col).
+
+    Handles tables with a leading serial number / roman numeral column
+    by detecting it and using the next column as the label column.
     """
     ncols = len(df.columns)
     if ncols < 2:
         return 0, -1, -1
+
+    # Detect label column: skip leading serial number columns
+    label_col = 0
+    if ncols >= 3 and _is_serial_column(df, 0):
+        label_col = 1
 
     # Count numeric values per column (skip potential header rows)
     numeric_counts = [0] * ncols
@@ -221,10 +268,10 @@ def _identify_value_columns_df(df) -> tuple[int, int, int]:
 
     min_threshold = max(1, len(df) * 0.15)
 
-    # Collect columns with enough numeric data (exclude first column - labels)
+    # Collect columns with enough numeric data (exclude label column and before)
     value_candidates = [
         (c, cnt) for c, cnt in enumerate(numeric_counts)
-        if cnt >= min_threshold and c > 0
+        if cnt >= min_threshold and c > label_col
     ]
     value_candidates.sort(key=lambda x: x[0])
 
@@ -238,7 +285,7 @@ def _identify_value_columns_df(df) -> tuple[int, int, int]:
         curr_col = ncols - 2 if ncols >= 3 else ncols - 1
         prev_col = ncols - 1 if ncols >= 3 else -1
 
-    return 0, curr_col, prev_col
+    return label_col, curr_col, prev_col
 
 
 def _find_best_pnl_table(tables) -> tuple:
@@ -246,7 +293,8 @@ def _find_best_pnl_table(tables) -> tuple:
     pnl_keywords = [
         'revenue from operations', 'profit before tax', 'profit for the year',
         'total income', 'other expenses', 'employee benefits', 'total expenses',
-        'depreciation', 'finance cost',
+        'depreciation', 'finance cost', 'administrative charges',
+        'cost of materials consumed', 'profit and loss',
     ]
 
     best_table = None
@@ -266,13 +314,20 @@ def _find_best_pnl_table(tables) -> tuple:
     return (best_table, best_idx) if best_score >= 3 else (None, -1)
 
 
-def _extract_pnl_from_df(df) -> tuple[dict, dict]:
-    """Extract P&L line items and note refs from a DataFrame table."""
+def _extract_pnl_from_df(df) -> tuple[dict, dict, dict]:
+    """Extract P&L line items and note refs from a DataFrame table.
+
+    Returns:
+        (extracted, note_refs, matched_labels) where matched_labels maps
+        canonical item names to the actual label text found in the table
+        (e.g. {'Other expenses': 'Administrative Charges'}).
+    """
     label_col, curr_col, prev_col = _identify_value_columns_df(df)
     logger.info(f"Column mapping: label={label_col}, current={curr_col}, previous={prev_col}")
 
     extracted = {}
     note_refs = {}
+    matched_labels = {}
 
     for item_name, patterns in PNL_ITEMS.items():
         for _, row in df.iterrows():
@@ -291,6 +346,7 @@ def _extract_pnl_from_df(df) -> tuple[dict, dict]:
                     'current': curr_val,
                     'previous': prev_val if prev_val is not None else 0.0,
                 }
+                matched_labels[item_name] = label
                 # Check for note reference in intermediate columns
                 for c in range(label_col + 1, curr_col):
                     if c < ncols:
@@ -300,7 +356,7 @@ def _extract_pnl_from_df(df) -> tuple[dict, dict]:
                             break
                 break
 
-    return extracted, note_refs
+    return extracted, note_refs, matched_labels
 
 
 # -------------------------------------------------------------------
@@ -360,28 +416,39 @@ def extract_pnl_docling(pdf_path: str, pnl_page: int) -> dict:
         logger.info(f"P&L table: {len(pnl_table)} rows x {len(pnl_table.columns)} cols")
 
         # Extract line items
-        extracted, note_refs = _extract_pnl_from_df(pnl_table)
+        extracted, note_refs, matched_labels = _extract_pnl_from_df(pnl_table)
 
         logger.info(f"Docling extracted {len(extracted)} P&L items: {list(extracted.keys())}")
+        if matched_labels:
+            logger.info(f"Matched labels: {matched_labels}")
 
         # Fallback: extract note reference from raw text if Docling missed it
         if 'Other expenses' in extracted and 'Other expenses' not in note_refs:
-            text_note_ref = _extract_note_ref_from_text(pdf_path, pnl_page)
+            # Use the actual matched label for text search
+            oe_label = matched_labels.get('Other expenses', 'other expenses')
+            text_note_ref = _extract_note_ref_from_text(
+                pdf_path, pnl_page, oe_label.lower()
+            )
             if text_note_ref:
                 note_refs['Other expenses'] = text_note_ref
-                logger.info(f"Note ref for 'Other expenses' found via text fallback: "
-                            f"{text_note_ref}")
+                logger.info(f"Note ref for 'Other expenses' ({oe_label}) "
+                            f"found via text fallback: {text_note_ref}")
 
     finally:
         os.unlink(temp_pdf)
 
     company = _detect_company_name(pdf_path, pnl_page)
 
+    # Store the actual label used for "Other expenses" so downstream code
+    # can use it as the search keyword for note page identification.
+    oe_actual_label = matched_labels.get('Other expenses', 'Other expenses')
+
     return {
         'company': company,
         'currency': 'INR Million',
         'items': extracted,
         'note_refs': note_refs,
+        'operating_expense_label': oe_actual_label,
     }
 
 
@@ -399,6 +466,7 @@ _NOTE_EXPENSE_KEYWORDS = [
     'recruitment', 'training', 'subscription', 'membership',
     'bank charges', 'office', 'software', 'license', 'audit',
     'donation', 'bad debts', 'provision', 'loss on',
+    'administrative', 'filing', 'listing', 'commission',
 ]
 
 
@@ -424,8 +492,8 @@ def _find_best_note_table(tables, note_number: str):
         # Strong signal: note number heading (e.g. "27." or "note 27")
         if re.search(rf'\b{note_esc}\s*[.\-–—:)]', text):
             score += 4
-        # Strong signal: "other expenses" in table
-        if 'other expenses' in text:
+        # Strong signal: expense heading in table
+        if 'other expenses' in text or 'administrative charges' in text:
             score += 4
         # Moderate signal: common expense keywords
         expense_hits = sum(1 for kw in _NOTE_EXPENSE_KEYWORDS if kw in text)
@@ -607,7 +675,8 @@ def _extract_note_items_from_df(df, note_number: str) -> tuple[list[dict], dict 
         if re.match(rf'^\s*{note_esc}\s*[.\-–—:)]', label, re.IGNORECASE):
             continue
         # Skip rows that are just the keyword header
-        if label_lower in ('other expenses', 'other expense'):
+        if label_lower in ('other expenses', 'other expense',
+                           'administrative charges', 'administrative expenses'):
             continue
 
         curr_val = _parse_number(row.iloc[curr_col]) if 0 <= curr_col < ncols else None

@@ -13,6 +13,19 @@ from app.pdf_utils import is_note_ref, is_value_line, parse_number
 # Stage 1: Find standalone financial statement pages
 # -------------------------------------------------------------------
 
+# P&L title variants found across different annual reports
+_PNL_TITLE_PATTERNS = [
+    'statement of profit and loss',
+    'profit and loss account',
+    'profit and loss statement',
+]
+
+
+def _has_pnl_title(text_lower: str) -> bool:
+    """Check if text contains any recognised P&L title variant."""
+    return any(p in text_lower for p in _PNL_TITLE_PATTERNS)
+
+
 def _has_consolidated_section(doc) -> bool:
     """Check if the PDF contains consolidated financial statements.
 
@@ -23,7 +36,7 @@ def _has_consolidated_section(doc) -> bool:
     for i in range(doc.page_count):
         text = doc[i].get_text().lower()
         if 'consolidated' in text and (
-            'statement of profit and loss' in text
+            _has_pnl_title(text)
             or 'balance sheet' in text
             or 'cash flow' in text
         ):
@@ -45,7 +58,7 @@ def find_standalone_pages(pdf_path: str) -> tuple[dict, int]:
     for i in range(doc.page_count):
         text = doc[i].get_text()
         lower = text.lower()
-        if 'statement of profit and loss' in lower and 'standalone' in lower and 'pnl' not in pages:
+        if _has_pnl_title(lower) and 'standalone' in lower and 'pnl' not in pages:
             pages['pnl'] = i
         if 'balance sheet' in lower and 'standalone' in lower and 'bs' not in pages:
             pages['bs'] = i
@@ -57,7 +70,7 @@ def find_standalone_pages(pdf_path: str) -> tuple[dict, int]:
         for i in range(doc.page_count):
             text = doc[i].get_text()
             lower = text.lower()
-            if 'statement of profit and loss' in lower and 'pnl' not in pages:
+            if _has_pnl_title(lower) and 'pnl' not in pages:
                 pages['pnl'] = i
             if 'balance sheet' in lower and 'bs' not in pages:
                 # Avoid matching table-of-contents or index pages
@@ -95,7 +108,7 @@ def find_all_standalone_candidates(pdf_path: str) -> dict[str, list[int]]:
         text = doc[i].get_text()
         lower = text.lower()
 
-        if 'statement of profit and loss' in lower:
+        if _has_pnl_title(lower):
             if has_consolidated:
                 # Only match explicitly labelled "standalone" pages
                 if 'standalone' in lower:
@@ -142,11 +155,12 @@ PNL_TARGETS = [
     ('Revenue from operations', ['Revenue from operations']),
     ('Other income', ['Other income']),
     ('Total income', ['Total income']),
+    ('Cost of materials consumed', ['Cost of materials consumed', 'Cost of materials']),
     ('Employee benefits expense', ['Employee benefits expense']),
     ('Cost of professionals', ['Cost of professionals']),
     ('Finance costs', ['Finance costs']),
     ('Depreciation and amortisation', ['Depreciation and amortisation', 'Depreciation and amortization']),
-    ('Other expenses', ['Other expenses']),
+    ('Other expenses', ['Other expenses', 'Administrative Charges', 'Administrative expenses']),
     ('Total expenses', ['Total expenses']),
     ('Profit before tax', ['Profit before exceptional', 'Profit before tax']),
     ('Current tax', ['Current tax']),
@@ -466,6 +480,7 @@ def compute_metrics(pnl: dict) -> dict:
     for period in ['current', 'previous']:
         rev = items.get('Revenue from operations', {}).get(period, 0) or 0
         oi = items.get('Other income', {}).get(period, 0) or 0
+        cmc = items.get('Cost of materials consumed', {}).get(period, 0) or 0
         emp = items.get('Employee benefits expense', {}).get(period, 0) or 0
         cop = items.get('Cost of professionals', {}).get(period, 0) or 0
         dep = items.get('Depreciation and amortisation', {}).get(period, 0) or 0
@@ -475,7 +490,7 @@ def compute_metrics(pnl: dict) -> dict:
         pat = items.get('Profit for the year', {}).get(period, 0) or 0
         pbt = items.get('Profit before tax', {}).get(period, 0) or 0
 
-        opex = emp + cop + dep + oe
+        opex = cmc + emp + cop + dep + oe
         op_profit = rev - opex
         ebitda = op_profit + dep
 
@@ -483,6 +498,7 @@ def compute_metrics(pnl: dict) -> dict:
             'Revenue from Operations': rev,
             'Other Income': oi,
             'Total Income': rev + oi,
+            'Cost of Materials Consumed': cmc,
             'Employee Benefits Expense': emp,
             'Cost of Professionals': cop,
             'Depreciation & Amortisation': dep,
