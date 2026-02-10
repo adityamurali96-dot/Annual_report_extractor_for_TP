@@ -152,6 +152,7 @@ def _run_extraction(pdf_path: str, job_id: str) -> dict:
     from app.docling_extractor import extract_note_docling, extract_pnl_docling
     from app.excel_writer import create_excel
     from app.extractor import (
+        _is_likely_toc_page,
         compute_pnl_confidence,
         find_all_standalone_candidates,
         find_note_page,
@@ -192,6 +193,19 @@ def _run_extraction(pdf_path: str, job_id: str) -> dict:
                 pages["cf"] = raw_pages["cash_flow"]
             if raw_pages.get("notes_start") is not None:
                 pages["notes_start"] = raw_pages["notes_start"]
+
+
+            # Guardrail: Claude can sometimes pick Table-of-Contents pages
+            # because they mention all statement names with page numbers.
+            for key, idx in list(pages.items()):
+                if idx is None:
+                    continue
+                page_text = extract_page_headers(pdf_path, {key: idx}, num_lines=40).get(key, "")
+                if page_text and _is_likely_toc_page(page_text):
+                    logger.warning(f"[{job_id}] Ignoring Claude {key} page {idx + 1}: likely TOC page")
+                    pages.pop(key, None)
+                    if key == "pnl":
+                        claude_identified = False
 
             logger.info(f"[{job_id}] Claude identified standalone pages: {pages}, "
                         f"Company: {company_name}, FY: {fy_current} / {fy_previous}")
