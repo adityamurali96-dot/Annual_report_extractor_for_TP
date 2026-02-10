@@ -205,8 +205,8 @@ def _run_extraction(pdf_path: str, job_id: str) -> dict:
 
     if "pnl" not in pages:
         raise ValueError(
-            "Could not find Standalone P&L page. "
-            "Please ensure the PDF is an annual report with standalone financial statements."
+            "Could not find a P&L (Statement of Profit and Loss) page. "
+            "Please ensure the PDF is an annual report with financial statements."
         )
 
     # ------------------------------------------------------------------
@@ -225,7 +225,7 @@ def _run_extraction(pdf_path: str, job_id: str) -> dict:
     if len(pnl_candidates) > 1:
         candidate_pages_display = ", ".join(str(p + 1) for p in pnl_candidates)
         warnings.append(
-            f"Multiple standalone P&L pages detected (PDF pages: {candidate_pages_display}). "
+            f"Multiple P&L pages detected (PDF pages: {candidate_pages_display}). "
             f"Extracted from page {pages['pnl'] + 1}. "
             f"Please verify the totals in the Validation sheet to ensure the correct page was used."
         )
@@ -235,18 +235,18 @@ def _run_extraction(pdf_path: str, job_id: str) -> dict:
     # Step 2: Extract page headers for validation
     # ------------------------------------------------------------------
     page_headers = extract_page_headers(pdf_path, pages)
-    logger.info(f"[{job_id}] Extracted headers from standalone pages: "
+    logger.info(f"[{job_id}] Extracted headers for identified pages: "
                 f"{list(page_headers.keys())}")
 
     # ------------------------------------------------------------------
-    # Step 3: Docling extracts P&L from targeted standalone page(s)
+    # Step 3: Docling extracts P&L from targeted page(s)
     # ------------------------------------------------------------------
-    logger.info(f"[{job_id}] Docling extracting P&L from standalone page {pages['pnl']}")
+    logger.info(f"[{job_id}] Docling extracting P&L from page {pages['pnl']}")
     pnl = extract_pnl_docling(pdf_path, pages["pnl"])
 
     if not pnl.get('items'):
         raise ValueError(
-            f"Could not extract any P&L line items from standalone page {pages['pnl']}. "
+            f"Could not extract any P&L line items from page {pages['pnl']}. "
             f"The PDF table structure may not be supported."
         )
 

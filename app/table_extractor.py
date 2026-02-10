@@ -430,11 +430,17 @@ def find_standalone_pages(pdf_path: str) -> tuple[dict, int]:
     """
     Identify pages containing standalone financial statements.
     Uses pymupdf4llm for text extraction with better layout preservation.
+
+    Falls back to matching without "standalone" for single-entity reports
+    that have no consolidated section.
     """
+    from app.extractor import _has_consolidated_section
+
     doc = fitz.open(pdf_path)
     pages = {}
     total = doc.page_count
 
+    # Pass 1: explicitly labelled "standalone" pages
     for i in range(total):
         text = doc[i].get_text()
         lower = text.lower()
@@ -445,6 +451,20 @@ def find_standalone_pages(pdf_path: str) -> tuple[dict, int]:
             pages['bs'] = i
         if 'cash flow' in lower and 'standalone' in lower and 'cf' not in pages:
             pages['cf'] = i
+
+    # Pass 2: single-entity fallback
+    if 'pnl' not in pages and not _has_consolidated_section(doc):
+        for i in range(total):
+            text = doc[i].get_text()
+            lower = text.lower()
+            if 'statement of profit and loss' in lower and 'pnl' not in pages:
+                pages['pnl'] = i
+            if 'balance sheet' in lower and 'bs' not in pages:
+                if len(text) > 200:
+                    pages['bs'] = i
+            if 'cash flow' in lower and 'cf' not in pages:
+                if len(text) > 200:
+                    pages['cf'] = i
 
     doc.close()
     return pages, total
