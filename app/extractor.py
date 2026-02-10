@@ -241,6 +241,34 @@ def find_note_page(pdf_path: str, note_number: str, search_start_page: int,
                     doc.close()
                     return i, j
 
+    # ------- Strategy 4: note heading only (no keyword required) -------
+    # Some reports have the note inside a big combined table where the
+    # keyword "Other expenses" does not appear as standalone text.
+    # Search for just the note number heading pattern in the notes section.
+    note_heading_re = re.compile(
+        rf'(?:^|\n)\s*(?:note\s*)?{note_esc}\s*[.\-–—:)]\s+[A-Za-z]',
+        re.IGNORECASE | re.MULTILINE,
+    )
+    for i in range(search_start_page, doc.page_count):
+        text = doc[i].get_text()
+        m = note_heading_re.search(text)
+        if m:
+            lines = [l.strip() for l in text.split('\n')]
+            for j, line in enumerate(lines):
+                if re.search(rf'(?:note\s*)?{note_esc}\s*[.\-–—:)]', line, re.IGNORECASE):
+                    doc.close()
+                    return i, j
+
+    # ------- Strategy 5: keyword on page in notes section -------
+    # If the note number heading is absent (no heading), just find a page
+    # in the notes section that mentions the keyword "Other expenses".
+    for i in range(search_start_page, doc.page_count):
+        text = doc[i].get_text()
+        lower_text = text.lower()
+        if keyword_lower in lower_text and 'expense' in lower_text:
+            doc.close()
+            return i, None
+
     doc.close()
     return None, None
 
