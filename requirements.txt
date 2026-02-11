@@ -7,3 +7,4 @@ openpyxl==3.1.5
 opencv-python-headless
 docling
 anthropic
+easyocr

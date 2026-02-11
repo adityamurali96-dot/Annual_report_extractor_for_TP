@@ -156,13 +156,25 @@ def _run_extraction(pdf_path: str, job_id: str) -> dict:
         compute_pnl_confidence,
         find_all_standalone_candidates,
         find_note_page,
+        find_pnl_by_content_scoring,
         validate_note_extraction,
     )
     from app.extractor import find_standalone_pages as find_standalone_pages_regex
-    from app.pdf_utils import extract_page_headers
+    from app.pdf_utils import extract_page_headers, is_scanned_pdf
 
     excel_path = str(UPLOAD_DIR / f"{job_id}_output.xlsx")
     warnings: list[str] = []
+
+    # ------------------------------------------------------------------
+    # Step 0: Detect scanned PDF
+    # ------------------------------------------------------------------
+    scanned = is_scanned_pdf(pdf_path)
+    if scanned:
+        logger.info(f"[{job_id}] Scanned/image-based PDF detected — OCR will be used")
+        warnings.append(
+            "This PDF appears to be scanned/image-based. OCR was used for text extraction. "
+            "Please verify the extracted data carefully as OCR accuracy may vary."
+        )
 
     # ------------------------------------------------------------------
     # Step 1: Identify standalone pages (Claude API primary, regex fallback)
@@ -212,10 +224,24 @@ def _run_extraction(pdf_path: str, job_id: str) -> dict:
         except Exception as e:
             logger.warning(f"[{job_id}] Claude page identification failed: {e}")
 
-    # Fallback: regex (only if Claude didn't find pages)
+    # Fallback 1: regex title matching (only if Claude didn't find pages)
     if "pnl" not in pages:
         logger.info(f"[{job_id}] Falling back to regex page identification")
         pages, _ = find_standalone_pages_regex(pdf_path)
+
+    # Fallback 2: content-based scoring (when no title match found)
+    # This handles PDFs with no index, scanned documents with OCR-damaged
+    # titles, or unusual formatting.
+    if "pnl" not in pages:
+        logger.info(f"[{job_id}] Regex failed, trying content-based scoring")
+        scored_pages = find_pnl_by_content_scoring(pdf_path, min_score=20)
+        if scored_pages:
+            pages.update(scored_pages)
+            warnings.append(
+                "P&L page was identified by content scoring (no standard title found). "
+                "Please verify the extracted data in the Validation sheet."
+            )
+            logger.info(f"[{job_id}] Content scoring found P&L at page {scored_pages.get('pnl', '?')}")
 
     if "pnl" not in pages:
         raise ValueError(

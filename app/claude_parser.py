@@ -47,13 +47,31 @@ CRITICAL RULES:
    - **Single-entity reports** have only ONE set of financial statements (no "Standalone" or "Consolidated" labels). In these reports, identify the financial statements directly — they are implicitly standalone.
 
 2. **How to distinguish:**
-   - If you see pages with headers containing "Consolidated" (e.g., "Consolidated Statement of Profit and Loss"), this is a multi-section report. Find the pages labelled "Standalone" instead.
+   - If you see pages with headers containing "Consolidated" (e.g., "Consolidated Statement of Profit and Loss"), this is a multi-section report. Find the pages labelled "Standalone" or "Separate" instead.
    - If NO page mentions "Consolidated" at all, this is a single-entity report. The financial statements you find are the ones to use.
 
 3. The standalone section usually appears BEFORE the consolidated section in Indian annual reports, but not always.
 
+4. **IMPORTANT — Recognise P&L title variations.** The P&L statement can have many different titles across reports:
+   - "Statement of Profit and Loss"
+   - "Profit and Loss Account"
+   - "Profit and Loss Statement"
+   - "Statement of Profit or Loss" (IFRS)
+   - "Statement of Income and Expenses"
+   - "Income and Expenditure Account" (non-profit entities)
+   - "Statement of Operations"
+   - "Statement of Comprehensive Income"
+   - Sometimes the title is split across lines or OCR-damaged (e.g., "Staternent of Profit and Loss")
+   - The key signals are the CONTENT: look for pages with "Revenue from operations", "Profit before tax", "Total income", "Total expenses", "Earnings per share"
+
+5. **IMPORTANT — Handle scanned/OCR PDFs.** Text from scanned PDFs may be garbled, have extra spaces, misspelled words, or broken formatting. Look at the overall structure and keywords rather than exact title matches. If the extracted text is mostly empty or garbled, use whatever signals are available.
+
+6. **IMPORTANT — No table of contents / index.** Some PDFs have no table of contents. Search through ALL pages for the actual financial statements, not just pages referenced from an index.
+
+7. **IMPORTANT — Labels.** Some reports use "Separate" instead of "Standalone". Treat "Separate Financial Statements" the same as "Standalone Financial Statements".
+
 Look for these sections:
-1. **Statement of Profit and Loss** (may also be titled "Profit and Loss Account" or "Profit and Loss Statement") - the P&L statement
+1. **Statement of Profit and Loss** (see title variations above) - the P&L statement
 2. **Balance Sheet** - assets and liabilities
 3. **Cash Flow Statement** - cash flows
 4. **Notes to Financial Statements** - the starting page of notes
@@ -104,12 +122,16 @@ def identify_pages(pdf_path: str) -> dict:
     client = _get_client()
     all_pages = extract_pdf_text(pdf_path)
 
-    # Build a condensed view - first 15 lines of each page to save tokens
+    # Build a condensed view of each page.
+    # Use first 20 lines to capture more context (some reports have
+    # multi-line headers, date ranges, and currency info before content).
     page_summaries = []
     for p in all_pages:
-        lines = p["text"].split('\n')[:15]
+        lines = p["text"].split('\n')[:20]
         summary = '\n'.join(lines)
-        page_summaries.append(f"=== PAGE {p['page']} ===\n{summary}")
+        # Skip completely empty pages (scanned pages with no OCR text)
+        if summary.strip():
+            page_summaries.append(f"=== PAGE {p['page']} ===\n{summary}")
 
     # Send in batches if too many pages
     batch_size = 80

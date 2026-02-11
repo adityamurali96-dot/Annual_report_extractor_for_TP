@@ -19,16 +19,44 @@ from app.pdf_utils import is_note_ref, is_value_line, parse_number
 #   - "Statement of Standalone Profit and Loss"
 #   - "Statement of Profit\nand Loss"
 #   - "Profit & Loss Account"
+#   - "Statement of Profit or Loss"  (IFRS terminology)
+#   - "Income and Expenditure Account" (non-profit / older format)
+#   - "Statement of Income and Expenses"
 _PNL_TITLE_REGEXES = [
+    # Standard Indian GAAP / Ind AS titles
     re.compile(r'statement\s+of\s+(?:standalone\s+)?profit\s*(?:and|&)\s*loss'),
     re.compile(r'profit\s*(?:and|&)\s*loss\s+account'),
     re.compile(r'profit\s*(?:and|&)\s*loss\s+statement'),
+    # IFRS / international variants
+    re.compile(r'statement\s+of\s+profit\s+or\s+loss'),
+    re.compile(r'statement\s+of\s+(?:total\s+)?(?:comprehensive\s+)?income'),
+    re.compile(r'statement\s+of\s+income\s+and\s+expenses?'),
+    re.compile(r'statement\s+of\s+operations'),
+    # Older / non-profit / alternate formats
+    re.compile(r'income\s+and\s+expenditure\s+(?:account|statement)'),
+    re.compile(r'income\s+(?:and|&)\s+expense\s+statement'),
+    re.compile(r'revenue\s+(?:account|statement)'),
+    # Short-form / OCR-damaged titles
+    re.compile(r'(?:standalone\s+)?p\s*(?:&|and)\s*l\s+(?:account|statement)'),
+    # Catch-all with "profit" and "loss" close together
+    re.compile(r'profit\s*(?:and|&|or)\s*loss'),
 ]
 
 
 def _normalise_for_title_match(text: str) -> str:
-    """Normalise whitespace and punctuation for robust title matching."""
+    """Normalise whitespace and punctuation for robust title matching.
+
+    Handles OCR artefacts, Unicode variants, and formatting differences.
+    """
     lower = text.lower()
+    # Normalise Unicode dashes, quotes, and special characters
+    lower = lower.replace('\u2018', "'").replace('\u2019', "'")
+    lower = lower.replace('\u201c', '"').replace('\u201d', '"')
+    lower = lower.replace('\u2014', '-').replace('\u2013', '-').replace('\u2012', '-')
+    lower = lower.replace('\u00a0', ' ')  # non-breaking space
+    # Common OCR artefacts: 'l' <-> '1', 'O' <-> '0', 'S' <-> '5'
+    # We don't do character replacement but collapse noise chars
+    lower = re.sub(r'[|_~]', ' ', lower)
     # Join line breaks/hard spacing to handle split titles.
     lower = re.sub(r'\s+', ' ', lower)
     # Treat slash/hyphen variants as separators.
@@ -55,24 +83,173 @@ def _is_likely_toc_page(text: str) -> bool:
         return False
 
     joined_header = ' '.join(lines[:8]).lower()
-    if any(marker in joined_header for marker in ('table of contents', 'contents', 'index')):
-        return True
+    # Expanded markers to catch more TOC/index variations
+    toc_markers = (
+        'table of contents', 'contents', 'index',
+        'sr. no.', 'sr no', 'serial no', 'particulars',
+        'list of', 'annexure',
+    )
+    # Only treat "contents" and "index" as TOC if they appear as standalone
+    # headings (not as part of longer phrases like "insurance contents")
+    for marker in toc_markers:
+        if marker in joined_header:
+            # For short markers, verify they appear as a heading
+            if marker in ('contents', 'index'):
+                # Must appear as a standalone word/heading
+                if re.search(rf'\b{marker}\b', joined_header):
+                    return True
+            else:
+                return True
 
     toc_entry_pattern = re.compile(
         r"^.*[A-Za-z].*(?:\.{2,}|\s)\d{1,3}(?:\s*-\s*\d{1,3})?$"
     )
+    # Also catch entries like "Profit and Loss Statement ........... 42"
+    toc_dotted_pattern = re.compile(r'\.{3,}')
+
     toc_like = 0
+    dotted_lines = 0
     for line in lines[:50]:
         # Skip normal financial value rows (usually include commas/decimals).
         if ',' in line or re.search(r'\d+\.\d+', line):
             continue
         if toc_entry_pattern.match(line):
             toc_like += 1
+        if toc_dotted_pattern.search(line):
+            dotted_lines += 1
 
     sample_size = min(len(lines), 50)
 
     # Require both absolute and relative density to avoid false positives.
-    return toc_like >= 4 and (toc_like / max(sample_size, 1)) >= 0.20
+    if toc_like >= 4 and (toc_like / max(sample_size, 1)) >= 0.20:
+        return True
+    # Many dotted leader lines is also a strong TOC signal
+    if dotted_lines >= 5:
+        return True
+
+    return False
+
+
+# -------------------------------------------------------------------
+# Content-based P&L page scoring (fallback when no title match)
+# -------------------------------------------------------------------
+
+# Keywords strongly associated with P&L / Statement of Profit and Loss pages.
+# Weighted by specificity: higher weight = more unique to P&L pages.
+_PNL_CONTENT_KEYWORDS = {
+    # Very strong signals (unique to P&L)
+    'revenue from operations': 5,
+    'profit before tax': 5,
+    'profit for the year': 5,
+    'profit for the period': 5,
+    'profit before exceptional': 5,
+    'total comprehensive income': 4,
+    'earnings per share': 4,
+    'basic eps': 4,
+    'diluted eps': 4,
+    # Strong signals
+    'other income': 3,
+    'total income': 3,
+    'total expenses': 3,
+    'employee benefits expense': 3,
+    'employee benefit expense': 3,
+    'finance costs': 3,
+    'finance cost': 3,
+    'depreciation and amortisation': 3,
+    'depreciation and amortization': 3,
+    'cost of materials consumed': 3,
+    'other expenses': 2,
+    'current tax': 2,
+    'deferred tax': 2,
+    'tax expense': 2,
+    # Moderate signals (present in P&L but also in other statements)
+    'income from operations': 2,
+    'operating revenue': 2,
+    'cost of goods sold': 2,
+    'cost of revenue': 2,
+    'gross profit': 2,
+    'operating profit': 2,
+    'net profit': 2,
+    'profit after tax': 2,
+    'loss before tax': 2,
+    'loss for the year': 2,
+    'ebitda': 1,
+}
+
+# Keywords that indicate a page is NOT a P&L page (negative signals).
+_PNL_NEGATIVE_KEYWORDS = [
+    'table of contents', 'contents', 'index',
+    'director', 'auditor', 'governance', 'management discussion',
+    'chairman', 'board of', 'secretary', 'compliance',
+    'notice of', 'agenda',
+]
+
+
+def _score_page_as_pnl(text: str) -> int:
+    """Score a page for how likely it is to be a P&L statement.
+
+    Returns a weighted score. Higher = more likely to be P&L.
+    Typical genuine P&L pages score 25+. Non-P&L pages score < 10.
+    """
+    lower = _normalise_for_title_match(text)
+    score = 0
+
+    # Positive signals
+    for keyword, weight in _PNL_CONTENT_KEYWORDS.items():
+        if keyword in lower:
+            score += weight
+
+    # Negative signals (pages that mention P&L keywords in passing)
+    for neg_kw in _PNL_NEGATIVE_KEYWORDS:
+        if neg_kw in lower:
+            score -= 8
+
+    # Bonus: if the page has a recognisable P&L title
+    if _has_pnl_title(text.lower()):
+        score += 10
+
+    # Penalise very short pages (likely headers/footers only)
+    if len(text.strip()) < 200:
+        score -= 10
+
+    # Penalise TOC-like pages
+    if _is_likely_toc_page(text):
+        score -= 20
+
+    return score
+
+
+def find_pnl_by_content_scoring(pdf_path: str, min_score: int = 20) -> dict:
+    """Find P&L page by scoring each page on financial keyword density.
+
+    This is used as a last-resort fallback when neither Claude nor regex
+    title matching finds a P&L page (e.g. scanned PDFs, no index, unusual
+    formatting, or OCR-damaged titles).
+
+    Args:
+        pdf_path: Path to the PDF file
+        min_score: Minimum score to consider a page as P&L (default 20)
+
+    Returns:
+        Dict with 'pnl' key mapping to the best scoring page index,
+        or empty dict if no page scores above min_score.
+    """
+    doc = fitz.open(pdf_path)
+    best_page = -1
+    best_score = 0
+
+    for i in range(doc.page_count):
+        text = doc[i].get_text()
+        score = _score_page_as_pnl(text)
+        if score > best_score:
+            best_score = score
+            best_page = i
+
+    doc.close()
+
+    if best_score >= min_score and best_page >= 0:
+        return {'pnl': best_page}
+    return {}
 
 
 def _has_consolidated_section(doc) -> bool:
@@ -97,12 +274,23 @@ def _has_consolidated_section(doc) -> bool:
     return False
 
 
+# Variations of "standalone" label across different annual reports
+_STANDALONE_LABELS = ['standalone', 'separate', 'individual']
+
+
+def _has_standalone_label(text_lower: str) -> bool:
+    """Check if text contains any variant of 'standalone' labelling."""
+    return any(label in text_lower for label in _STANDALONE_LABELS)
+
+
 def find_standalone_pages(pdf_path: str) -> tuple[dict, int]:
     """Identify pages containing standalone financial statements.
 
-    First tries to match pages labelled "standalone".  If none are found and
-    the report has no consolidated section (i.e. it's a single-entity report),
-    falls back to matching pages with just the statement name.
+    Uses a multi-pass strategy:
+      Pass 1: Look for pages explicitly labelled "standalone" / "separate"
+      Pass 2: For single-entity reports (no consolidated section), match
+              any page with a financial statement title
+      Pass 3: Content-based scoring fallback for P&L pages
     """
     doc = fitz.open(pdf_path)
     pages = {}
@@ -113,11 +301,11 @@ def find_standalone_pages(pdf_path: str) -> tuple[dict, int]:
         if _is_likely_toc_page(text):
             continue
         lower = text.lower()
-        if _has_pnl_title(lower) and 'standalone' in lower and 'pnl' not in pages:
+        if _has_pnl_title(lower) and _has_standalone_label(lower) and 'pnl' not in pages:
             pages['pnl'] = i
-        if 'balance sheet' in lower and 'standalone' in lower and 'bs' not in pages:
+        if 'balance sheet' in lower and _has_standalone_label(lower) and 'bs' not in pages:
             pages['bs'] = i
-        if 'cash flow' in lower and 'standalone' in lower and 'cf' not in pages:
+        if 'cash flow' in lower and _has_standalone_label(lower) and 'cf' not in pages:
             pages['cf'] = i
 
     # --- Pass 2: single-entity fallback (no consolidated section) ---
@@ -137,6 +325,19 @@ def find_standalone_pages(pdf_path: str) -> tuple[dict, int]:
                 if len(text) > 200:
                     pages['cf'] = i
 
+    # --- Pass 3: content-based scoring fallback for P&L ---
+    if 'pnl' not in pages:
+        best_page = -1
+        best_score = 0
+        for i in range(doc.page_count):
+            text = doc[i].get_text()
+            score = _score_page_as_pnl(text)
+            if score > best_score:
+                best_score = score
+                best_page = i
+        if best_score >= 20 and best_page >= 0:
+            pages['pnl'] = best_page
+
     total = doc.page_count
     doc.close()
     return pages, total
@@ -152,6 +353,8 @@ def find_all_standalone_candidates(pdf_path: str) -> dict[str, list[int]]:
 
     For single-entity reports (no consolidated section), pages are matched
     by "statement of profit and loss" alone.
+
+    Also includes content-scored pages as candidates when they score highly.
 
     Returns:
         Dict with "pnl" key mapping to list of 0-indexed page numbers:
@@ -169,11 +372,19 @@ def find_all_standalone_candidates(pdf_path: str) -> dict[str, list[int]]:
 
         if _has_pnl_title(lower):
             if has_consolidated:
-                # Only match explicitly labelled "standalone" pages
-                if 'standalone' in lower:
+                # Only match explicitly labelled "standalone" / "separate" pages
+                if _has_standalone_label(lower):
                     candidates['pnl'].append(i)
             else:
                 # Single-entity report: any P&L page is a candidate
+                candidates['pnl'].append(i)
+
+    # If no title-based candidates found, try content scoring
+    if not candidates['pnl']:
+        for i in range(doc.page_count):
+            text = doc[i].get_text()
+            score = _score_page_as_pnl(text)
+            if score >= 20:
                 candidates['pnl'].append(i)
 
     doc.close()
