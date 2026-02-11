@@ -185,8 +185,15 @@ _PNL_NEGATIVE_KEYWORDS = [
 ]
 
 
-def _score_page_as_pnl(text: str) -> int:
+def _score_page_as_pnl(text: str, require_standalone: bool = False) -> int:
     """Score a page for how likely it is to be a P&L statement.
+
+    Args:
+        text: Raw text of the page.
+        require_standalone: If True, pages labelled "consolidated" are
+            heavily penalised and pages with a standalone/separate label
+            get a bonus. Set this to True when the document is known to
+            contain both standalone and consolidated sections.
 
     Returns a weighted score. Higher = more likely to be P&L.
     Typical genuine P&L pages score 25+. Non-P&L pages score < 10.
@@ -216,6 +223,17 @@ def _score_page_as_pnl(text: str) -> int:
     if _is_likely_toc_page(text):
         score -= 20
 
+    # --- Guardrails for multi-section reports ---
+    if require_standalone:
+        # Heavily penalise consolidated pages so we don't accidentally
+        # pick the consolidated P&L instead of standalone.
+        header_text = '\n'.join(text.split('\n')[:10]).lower()
+        if 'consolidated' in header_text:
+            score -= 30
+        # Bonus for pages explicitly labelled standalone/separate
+        if _has_standalone_label(header_text):
+            score += 15
+
     return score
 
 
@@ -226,6 +244,12 @@ def find_pnl_by_content_scoring(pdf_path: str, min_score: int = 20) -> dict:
     title matching finds a P&L page (e.g. scanned PDFs, no index, unusual
     formatting, or OCR-damaged titles).
 
+    GUARDRAIL: If the document contains a consolidated section, content
+    scoring is applied with ``require_standalone=True`` so that
+    consolidated pages are penalised and standalone pages are preferred.
+    Without this guard, generic P&L keywords like "staff cost" or
+    "profit before tax" could match the consolidated P&L instead.
+
     Args:
         pdf_path: Path to the PDF file
         min_score: Minimum score to consider a page as P&L (default 20)
@@ -235,12 +259,17 @@ def find_pnl_by_content_scoring(pdf_path: str, min_score: int = 20) -> dict:
         or empty dict if no page scores above min_score.
     """
     doc = fitz.open(pdf_path)
+
+    # Determine if this is a multi-section report so we can guard
+    # against accidentally picking a consolidated page.
+    has_consolidated = _has_consolidated_section(doc)
+
     best_page = -1
     best_score = 0
 
     for i in range(doc.page_count):
         text = doc[i].get_text()
-        score = _score_page_as_pnl(text)
+        score = _score_page_as_pnl(text, require_standalone=has_consolidated)
         if score > best_score:
             best_score = score
             best_page = i
@@ -258,6 +287,10 @@ def _has_consolidated_section(doc) -> bool:
     Only checks page headers (first ~10 lines) so that incidental mentions
     of 'consolidated' in notes, table of contents, or director's report
     don't cause false positives.
+
+    Also returns True if the document has explicit "standalone" / "separate"
+    labels on any financial statement page, since that implies the existence
+    of a separate consolidated section (even if we haven't scanned it yet).
     """
     for i in range(doc.page_count):
         text = doc[i].get_text()
@@ -265,11 +298,18 @@ def _has_consolidated_section(doc) -> bool:
             continue
         # Only look at the first ~10 lines (page header/title area)
         header = '\n'.join(text.split('\n')[:10]).lower()
-        if 'consolidated' in header and (
+        is_financial = (
             _has_pnl_title(header)
             or 'balance sheet' in header
             or 'cash flow' in header
-        ):
+        )
+        if not is_financial:
+            continue
+        # Explicit consolidated label on a financial page
+        if 'consolidated' in header:
+            return True
+        # Explicit standalone/separate label implies consolidated exists elsewhere
+        if _has_standalone_label(header):
             return True
     return False
 
@@ -326,12 +366,18 @@ def find_standalone_pages(pdf_path: str) -> tuple[dict, int]:
                     pages['cf'] = i
 
     # --- Pass 3: content-based scoring fallback for P&L ---
+    # GUARDRAIL: only use content scoring when the doc has NO consolidated
+    # section, OR apply it with require_standalone=True so that consolidated
+    # pages are penalised.  Generic keywords (e.g. "staff cost", "profit
+    # before tax") appear on BOTH standalone and consolidated pages, so
+    # without this guard we could pick the wrong one.
     if 'pnl' not in pages:
+        has_consolidated = _has_consolidated_section(doc)
         best_page = -1
         best_score = 0
         for i in range(doc.page_count):
             text = doc[i].get_text()
-            score = _score_page_as_pnl(text)
+            score = _score_page_as_pnl(text, require_standalone=has_consolidated)
             if score > best_score:
                 best_score = score
                 best_page = i
@@ -379,11 +425,13 @@ def find_all_standalone_candidates(pdf_path: str) -> dict[str, list[int]]:
                 # Single-entity report: any P&L page is a candidate
                 candidates['pnl'].append(i)
 
-    # If no title-based candidates found, try content scoring
+    # If no title-based candidates found, try content scoring.
+    # GUARDRAIL: use require_standalone when consolidated section exists
+    # to avoid matching consolidated P&L pages.
     if not candidates['pnl']:
         for i in range(doc.page_count):
             text = doc[i].get_text()
-            score = _score_page_as_pnl(text)
+            score = _score_page_as_pnl(text, require_standalone=has_consolidated)
             if score >= 20:
                 candidates['pnl'].append(i)
 
