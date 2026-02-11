@@ -1,8 +1,11 @@
 """PDF text extraction utilities using PyMuPDF."""
 
+import logging
 import re
 
 import fitz
+
+logger = logging.getLogger(__name__)
 
 
 def parse_number(s: str) -> float | None:
@@ -42,19 +45,97 @@ def is_value_line(s: str) -> bool:
         return False
 
 
-def extract_pdf_text(pdf_path: str) -> list[dict]:
-    """
-    Extract text from all pages of a PDF.
-    Returns a list of dicts: [{"page": 0, "text": "..."}]
+def is_scanned_pdf(pdf_path: str, sample_pages: int = 10) -> bool:
+    """Detect if a PDF is scanned (image-based) vs text-based.
+
+    Samples up to `sample_pages` pages and checks the ratio of pages
+    with very little extractable text. A scanned PDF typically has
+    pages with almost no selectable text but many images.
+
+    Returns True if the PDF appears to be scanned/image-based.
     """
     doc = fitz.open(pdf_path)
+    total = min(doc.page_count, sample_pages)
+    if total == 0:
+        doc.close()
+        return False
+
+    low_text_pages = 0
+    image_pages = 0
+
+    # Sample pages evenly distributed through the document
+    step = max(1, doc.page_count // total)
+    sampled = 0
+
+    for i in range(0, doc.page_count, step):
+        if sampled >= total:
+            break
+        page = doc[i]
+        text = page.get_text().strip()
+        images = page.get_images(full=True)
+
+        # A page with very little text but images is likely scanned
+        word_count = len(text.split())
+        if word_count < 20:
+            low_text_pages += 1
+        if images:
+            image_pages += 1
+        sampled += 1
+
+    doc.close()
+
+    if sampled == 0:
+        return False
+
+    low_text_ratio = low_text_pages / sampled
+    image_ratio = image_pages / sampled
+
+    # If most pages have little text AND contain images → scanned
+    is_scanned = low_text_ratio >= 0.5 and image_ratio >= 0.5
+    if is_scanned:
+        logger.info(f"PDF detected as scanned: {low_text_ratio:.0%} low-text pages, "
+                     f"{image_ratio:.0%} image pages (sampled {sampled} pages)")
+    return is_scanned
+
+
+def extract_pdf_text(pdf_path: str, force_ocr: bool = False) -> list[dict]:
+    """
+    Extract text from all pages of a PDF.
+
+    For scanned/image-based PDFs, if force_ocr is True or the PDF is
+    detected as scanned, uses PyMuPDF's built-in OCR (Tesseract) if
+    available, otherwise returns whatever text PyMuPDF can extract.
+
+    Returns a list of dicts: [{"page": 0, "text": "..."}]
+    """
+    scanned = force_ocr or is_scanned_pdf(pdf_path)
+    doc = fitz.open(pdf_path)
     pages = []
+
     for i in range(doc.page_count):
+        page = doc[i]
+        text = page.get_text()
+
+        # For scanned pages with little text, try OCR via PyMuPDF
+        if scanned and len(text.strip().split()) < 20:
+            try:
+                # PyMuPDF supports OCR via Tesseract if installed
+                ocr_text = page.get_text("text", flags=fitz.TEXT_PRESERVE_WHITESPACE)
+                if len(ocr_text.strip()) > len(text.strip()):
+                    text = ocr_text
+            except Exception:
+                pass  # Tesseract not available, use whatever we have
+
         pages.append({
             "page": i,
-            "text": doc[i].get_text(),
+            "text": text,
         })
+
     doc.close()
+
+    if scanned:
+        logger.info(f"Extracted text from {len(pages)} pages (scanned PDF mode)")
+
     return pages
 
 

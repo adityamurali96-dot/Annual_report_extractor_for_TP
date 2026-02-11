@@ -15,15 +15,27 @@ import fitz
 
 logger = logging.getLogger(__name__)
 
-# Lazy-initialized converter (heavy import + model download on first use)
+# Lazy-initialized converters (heavy import + model download on first use)
 _converter = None
+_converter_ocr = None
 
 
-def _get_converter():
-    """Lazy-init the Docling DocumentConverter with table extraction enabled."""
-    global _converter
-    if _converter is not None:
-        return _converter
+def _get_converter(use_ocr: bool = False):
+    """Lazy-init the Docling DocumentConverter with table extraction enabled.
+
+    Args:
+        use_ocr: If True, returns a converter with OCR enabled for scanned PDFs.
+                 OCR uses EasyOCR which supports a wide range of scripts including
+                 Devanagari and other Indian languages common in annual reports.
+    """
+    global _converter, _converter_ocr
+
+    if use_ocr:
+        if _converter_ocr is not None:
+            return _converter_ocr
+    else:
+        if _converter is not None:
+            return _converter
 
     from docling.datamodel.base_models import InputFormat
     from docling.datamodel.pipeline_options import (
@@ -39,15 +51,38 @@ def _get_converter():
             mode=TableFormerMode.ACCURATE,
             do_cell_matching=True,
         ),
-        do_ocr=False,
+        do_ocr=use_ocr,
     )
 
-    _converter = DocumentConverter(
+    # If OCR is enabled, try to configure OCR options for better accuracy
+    if use_ocr:
+        try:
+            from docling.datamodel.pipeline_options import (
+                EasyOcrOptions,
+                OcrOptions,
+            )
+            ocr_options = EasyOcrOptions(
+                lang=["en"],  # English for financial statements
+                use_gpu=False,  # CPU-only for compatibility
+            )
+            pipeline_options.ocr_options = ocr_options
+            logger.info("Docling OCR configured with EasyOCR (English)")
+        except (ImportError, Exception) as e:
+            # Docling's built-in OCR will be used as default
+            logger.info(f"Using Docling default OCR config: {e}")
+
+    converter = DocumentConverter(
         format_options={
             InputFormat.PDF: PdfFormatOption(pipeline_options=pipeline_options),
         }
     )
-    return _converter
+
+    if use_ocr:
+        _converter_ocr = converter
+    else:
+        _converter = converter
+
+    return converter
 
 
 # -------------------------------------------------------------------
@@ -161,38 +196,64 @@ def _extract_note_ref_from_text(pdf_path: str, pnl_page: int,
 
 PNL_ITEMS = {
     'Revenue from operations': ['revenue from operations', 'revenue from operation',
-                                 'income from operations'],
-    'Other income': ['other income'],
-    'Total income': ['total income', 'total revenue'],
+                                 'income from operations', 'revenue from contracts',
+                                 'sale of products', 'sale of services',
+                                 'gross revenue', 'net revenue'],
+    'Other income': ['other income', 'other operating income'],
+    'Total income': ['total income', 'total revenue', 'gross income'],
     'Employee benefits expense': ['employee benefits expense', 'employee benefit expense',
-                                   'employee cost'],
+                                   'employee cost', 'staff cost', 'personnel cost',
+                                   'salaries and wages', 'manpower cost',
+                                   'employee remuneration'],
     'Cost of materials consumed': ['cost of materials consumed', 'cost of materials',
-                                    'cost of goods sold'],
+                                    'cost of goods sold', 'raw materials consumed',
+                                    'material cost', 'purchase of stock',
+                                    'purchases of traded goods'],
     'Cost of professionals': ['cost of professionals', 'subcontracting expense',
-                               'cost of services'],
-    'Finance costs': ['finance costs', 'finance cost', 'interest expense'],
+                               'cost of services', 'sub contracting',
+                               'technical sub contracting', 'outsourced manpower'],
+    'Finance costs': ['finance costs', 'finance cost', 'interest expense',
+                       'interest and finance', 'borrowing cost',
+                       'interest on borrowing'],
     'Depreciation and amortisation': ['depreciation and amortisation',
                                        'depreciation and amortization',
                                        'depreciation & amortisation',
-                                       'depreciation & amortization'],
+                                       'depreciation & amortization',
+                                       'depreciation, amortisation',
+                                       'depreciation, amortization',
+                                       'depreciation amortisation',
+                                       'depreciation amortization'],
     'Other expenses': ['other expenses', 'other expense',
                        'administrative charges', 'administrative expenses',
-                       'administrative expense'],
-    'Total expenses': ['total expenses', 'total expense'],
+                       'administrative expense', 'general expenses',
+                       'selling and distribution',
+                       'other operating expenses'],
+    'Total expenses': ['total expenses', 'total expense', 'total expenditure'],
     'Profit before tax': ['profit before exceptional', 'profit before tax',
                            'profit / (loss) before tax',
-                           'profit/(loss) before tax'],
+                           'profit/(loss) before tax',
+                           'income before tax',
+                           'surplus before tax',
+                           'profit (loss) before tax',
+                           'profit before income tax'],
     'Current tax': ['current tax'],
     'Deferred tax': ['deferred tax'],
-    'Total tax expense': ['total tax expense', 'tax expense'],
+    'Total tax expense': ['total tax expense', 'tax expense', 'income tax expense'],
     'Profit for the year': ['profit for the year', 'profit for the period',
                              'profit / (loss) for the year',
                              'profit/(loss) for the year',
                              'profit/(loss) for the period',
                              'profit / (loss) for the period',
-                             'net profit for the year'],
+                             'net profit for the year',
+                             'net profit for the period',
+                             'profit (loss) for the year',
+                             'profit (loss) for the period',
+                             'surplus for the year',
+                             'net income for the year'],
     'Total comprehensive income': ['total comprehensive income',
-                                    'total comprehensive income / (loss)'],
+                                    'total comprehensive income / (loss)',
+                                    'total comprehensive income/(loss)',
+                                    'total comprehensive income (loss)'],
     'Basic EPS': ['basic'],
     'Diluted EPS': ['diluted'],
 }
@@ -297,6 +358,13 @@ def _find_best_pnl_table(tables) -> tuple:
         'total income', 'other expenses', 'employee benefits', 'total expenses',
         'depreciation', 'finance cost', 'administrative charges',
         'cost of materials consumed', 'profit and loss',
+        # Additional keywords for broader matching
+        'income from operations', 'other income', 'current tax', 'deferred tax',
+        'earnings per share', 'basic', 'diluted', 'tax expense',
+        'profit after tax', 'net profit', 'comprehensive income',
+        'cost of goods sold', 'staff cost', 'personnel cost',
+        'gross revenue', 'net revenue', 'operating profit',
+        'total expenditure', 'income before tax',
     ]
 
     best_table = None
@@ -362,12 +430,49 @@ def _extract_pnl_from_df(df) -> tuple[dict, dict, dict]:
 
 
 # -------------------------------------------------------------------
+# Table extraction helper (with OCR retry)
+# -------------------------------------------------------------------
+
+
+def _extract_tables_from_pdf(pdf_path: str, use_ocr: bool = False) -> list:
+    """Extract all tables from a PDF using Docling.
+
+    Args:
+        pdf_path: Path to the (possibly subset) PDF file
+        use_ocr: Whether to enable OCR for scanned documents
+
+    Returns:
+        List of pandas DataFrames, one per detected table
+    """
+    try:
+        converter = _get_converter(use_ocr=use_ocr)
+        result = converter.convert(pdf_path)
+    except Exception as e:
+        logger.warning(f"Docling conversion failed (ocr={use_ocr}): {e}")
+        return []
+
+    tables = []
+    for table in result.document.tables:
+        try:
+            df = table.export_to_dataframe(doc=result.document)
+            if df is not None and len(df) >= 2:
+                tables.append(df)
+        except Exception as e:
+            logger.warning(f"Failed to export table as DataFrame: {e}")
+
+    return tables
+
+
+# -------------------------------------------------------------------
 # Public API: P&L extraction
 # -------------------------------------------------------------------
 
 def extract_pnl_docling(pdf_path: str, pnl_page: int) -> dict:
     """
     Extract P&L data using Docling from the identified standalone page.
+
+    Automatically detects scanned/image-based PDFs and enables OCR.
+    If initial extraction without OCR yields no tables, retries with OCR.
 
     Args:
         pdf_path: Path to the full annual report PDF
@@ -376,6 +481,8 @@ def extract_pnl_docling(pdf_path: str, pnl_page: int) -> dict:
     Returns:
         Dict with keys: company, currency, items, note_refs
     """
+    from app.pdf_utils import is_scanned_pdf
+
     doc = fitz.open(pdf_path)
     total_pages = doc.page_count
     doc.close()
@@ -387,22 +494,21 @@ def extract_pnl_docling(pdf_path: str, pnl_page: int) -> dict:
 
     logger.info(f"Docling: extracting tables from pages {target_pages}")
 
+    # Detect if we need OCR
+    use_ocr = is_scanned_pdf(pdf_path)
+    if use_ocr:
+        logger.info("Scanned PDF detected — enabling OCR for extraction")
+
     # Create temp PDF with only the target pages
     temp_pdf = _create_page_subset_pdf(pdf_path, target_pages)
 
     try:
-        converter = _get_converter()
-        result = converter.convert(temp_pdf)
+        tables = _extract_tables_from_pdf(temp_pdf, use_ocr)
 
-        # Get all tables as DataFrames
-        tables = []
-        for table in result.document.tables:
-            try:
-                df = table.export_to_dataframe(doc=result.document)
-                if df is not None and len(df) >= 2:
-                    tables.append(df)
-            except Exception as e:
-                logger.warning(f"Failed to export table as DataFrame: {e}")
+        # If no tables found without OCR, retry WITH OCR as fallback
+        if not tables and not use_ocr:
+            logger.info("No tables found without OCR, retrying with OCR enabled")
+            tables = _extract_tables_from_pdf(temp_pdf, use_ocr=True)
 
         logger.info(f"Docling extracted {len(tables)} tables from P&L pages")
 
@@ -423,6 +529,19 @@ def extract_pnl_docling(pdf_path: str, pnl_page: int) -> dict:
         logger.info(f"Docling extracted {len(extracted)} P&L items: {list(extracted.keys())}")
         if matched_labels:
             logger.info(f"Matched labels: {matched_labels}")
+
+        # If Docling extracted very few items, try other tables too
+        if len(extracted) < 5 and len(tables) > 1:
+            logger.info(f"Only {len(extracted)} items found, trying other tables")
+            for alt_idx, alt_table in enumerate(tables):
+                if alt_idx == idx:
+                    continue
+                alt_extracted, alt_refs, alt_labels = _extract_pnl_from_df(alt_table)
+                if len(alt_extracted) > len(extracted):
+                    logger.info(f"Alternative table {alt_idx} has {len(alt_extracted)} items")
+                    extracted = alt_extracted
+                    note_refs = alt_refs
+                    matched_labels = alt_labels
 
         # Fallback: extract note reference from raw text if Docling missed it
         if 'Other expenses' in extracted and 'Other expenses' not in note_refs:
@@ -849,6 +968,8 @@ def extract_note_docling(pdf_path: str, note_page: int,
     """
     Extract note breakup using Docling, with text-based fallback.
 
+    Automatically detects scanned PDFs and enables OCR when needed.
+
     Args:
         pdf_path: Path to PDF
         note_page: 0-indexed page of the note
@@ -857,6 +978,8 @@ def extract_note_docling(pdf_path: str, note_page: int,
     Returns:
         Tuple of (list of note items, total item or None)
     """
+    from app.pdf_utils import is_scanned_pdf
+
     doc = fitz.open(pdf_path)
     total_pages = doc.page_count
     doc.close()
@@ -869,20 +992,16 @@ def extract_note_docling(pdf_path: str, note_page: int,
 
     logger.info(f"Docling: extracting note tables from pages {target_pages}")
 
+    use_ocr = is_scanned_pdf(pdf_path)
     temp_pdf = _create_page_subset_pdf(pdf_path, target_pages)
 
     try:
-        converter = _get_converter()
-        result = converter.convert(temp_pdf)
+        tables = _extract_tables_from_pdf(temp_pdf, use_ocr=use_ocr)
 
-        tables = []
-        for table in result.document.tables:
-            try:
-                df = table.export_to_dataframe(doc=result.document)
-                if df is not None and len(df) >= 2:
-                    tables.append(df)
-            except Exception as e:
-                logger.warning(f"Failed to export note table: {e}")
+        # Retry with OCR if no tables found
+        if not tables and not use_ocr:
+            logger.info("No note tables found without OCR, retrying with OCR")
+            tables = _extract_tables_from_pdf(temp_pdf, use_ocr=True)
 
         if not tables:
             logger.warning("Docling found no tables on note pages, "
