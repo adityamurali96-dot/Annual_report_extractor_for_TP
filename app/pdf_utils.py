@@ -123,6 +123,94 @@ def is_scanned_pdf(pdf_path: str, sample_pages: int = 20) -> bool:
     return is_scanned
 
 
+def classify_pdf(pdf_path: str) -> str:
+    """
+    Classify a PDF into one of three types:
+
+    'text'             — Normal PDF. page.get_text() works.
+    'scanned'          — Each page is a full-page photograph/scan.
+                         page.get_text() returns nothing.
+                         page.get_images() returns big images.
+    'vector_outlined'  — Text converted to vector shapes (Bezier curves).
+                         page.get_text() returns nothing.
+                         page.get_images() returns nothing either.
+                         Content streams are huge (curves drawing letters).
+
+    Samples pages from front, middle, and back-quarter of the document.
+    """
+    doc = fitz.open(pdf_path)
+    total = doc.page_count
+    if total == 0:
+        doc.close()
+        return "text"
+
+    # Sample up to ~20 pages spread across the document
+    sample_indices = set()
+
+    # Front 3 pages
+    for i in range(min(3, total)):
+        sample_indices.add(i)
+
+    # Middle 10 pages (where financials typically are)
+    mid = total // 2
+    for i in range(max(0, mid - 5), min(total, mid + 5)):
+        sample_indices.add(i)
+
+    # Back quarter (where notes usually are)
+    q3 = (total * 3) // 4
+    for i in range(max(0, q3 - 3), min(total, q3 + 3)):
+        sample_indices.add(i)
+
+    text_pages = 0
+    image_pages = 0
+    vector_pages = 0
+
+    for i in sorted(sample_indices):
+        page = doc[i]
+
+        # Check 1: Does it have extractable text?
+        text = page.get_text().strip()
+        word_count = len(text.split()) if text else 0
+        if word_count >= 20:
+            text_pages += 1
+            continue
+
+        # Check 2: Does it have images? (scanned page)
+        images = page.get_images(full=True)
+        if len(images) > 0:
+            image_pages += 1
+            continue
+
+        # Check 3: Does it have heavy vector content? (outlined fonts)
+        # Lots of drawing commands but no text and no images means every
+        # character was converted to Bezier curves.
+        stream_bytes = 0
+        for s_xref in page.get_contents():
+            raw = doc.xref_stream(s_xref)
+            if raw:
+                stream_bytes += len(raw)
+        if stream_bytes > 50_000:  # > 50 KB of vector drawing data
+            vector_pages += 1
+
+    doc.close()
+    sampled = len(sample_indices)
+
+    logger.info(
+        f"[classify_pdf] Sampled {sampled}/{total} pages: "
+        f"text={text_pages}, scanned={image_pages}, vector={vector_pages}"
+    )
+
+    # Decision logic
+    if text_pages >= sampled * 0.4:
+        return "text"
+    if vector_pages > image_pages:
+        return "vector_outlined"
+    if image_pages > 0:
+        return "scanned"
+    # Default: treat as text and let the existing pipeline try
+    return "text"
+
+
 def extract_pdf_text(pdf_path: str, force_ocr: bool = False) -> list[dict]:
     """
     Extract text from all pages of a PDF.

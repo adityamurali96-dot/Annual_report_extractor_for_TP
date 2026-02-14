@@ -24,6 +24,10 @@ OCR_DPI = int(os.environ.get("OCR_DPI", "150"))
 CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "claude-sonnet-4-5-20250929")
 CLEANUP_AGE_SECONDS = int(os.environ.get("CLEANUP_AGE_SECONDS", "3600"))
 
+# Adobe PDF Services API (optional — for OCR of scanned/vector-outlined PDFs)
+ADOBE_CLIENT_ID = os.environ.get("ADOBE_CLIENT_ID", "")
+ADOBE_CLIENT_SECRET = os.environ.get("ADOBE_CLIENT_SECRET", "")
+
 # Server
 HOST = os.environ.get("HOST", "0.0.0.0")
 PORT = int(os.environ.get("PORT", 8000))

@@ -10,6 +10,7 @@ Pipeline (PDF-only, supports batch of up to 2 reports):
 
 import asyncio
 import logging
+import os
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
@@ -197,6 +198,7 @@ def _run_extraction(pdf_path: str, job_id: str) -> dict:
       4. Docling extracts note breakup from standalone notes
       5. Generate Excel
     """
+    from app.adobe_converter import convert_to_searchable_pdf, is_adobe_available
     from app.docling_extractor import extract_note_docling, extract_pnl_docling
     from app.excel_writer import create_excel
     from app.extractor import (
@@ -208,17 +210,51 @@ def _run_extraction(pdf_path: str, job_id: str) -> dict:
         validate_note_extraction,
     )
     from app.extractor import find_standalone_pages as find_standalone_pages_regex
-    from app.pdf_utils import extract_page_headers, is_scanned_pdf
+    from app.pdf_utils import classify_pdf, extract_page_headers, is_scanned_pdf
 
     excel_path = str(UPLOAD_DIR / f"{job_id}_output.xlsx")
     warnings: list[str] = []
+    converted_pdf_path = None
 
     # ------------------------------------------------------------------
-    # Step 0: Detect scanned PDF
+    # Step 0: Classify PDF type and convert if needed
     # ------------------------------------------------------------------
+    pdf_type = classify_pdf(pdf_path)
+    logger.info(f"[{job_id}] PDF classified as: {pdf_type}")
+
+    if pdf_type in ("scanned", "vector_outlined"):
+        type_label = {
+            "scanned": "scanned/image-based",
+            "vector_outlined": "vector-outlined (fonts converted to shapes)",
+        }[pdf_type]
+
+        if is_adobe_available():
+            logger.info(f"[{job_id}] PDF is {type_label}. Running Adobe OCR...")
+            try:
+                converted_pdf_path = convert_to_searchable_pdf(pdf_path)
+                pdf_path = converted_pdf_path
+                logger.info(f"[{job_id}] Adobe OCR successful. Using converted PDF.")
+                warnings.append(
+                    f"PDF detected as {type_label}. "
+                    f"Converted to searchable PDF via Adobe OCR before extraction."
+                )
+            except Exception as e:
+                logger.error(f"[{job_id}] Adobe OCR failed: {e}")
+                warnings.append(
+                    f"Adobe OCR conversion failed ({str(e)[:100]}). "
+                    f"Attempting extraction on original PDF."
+                )
+        else:
+            logger.warning(f"[{job_id}] PDF is {type_label} but Adobe API not configured.")
+            warnings.append(
+                f"PDF detected as {type_label}. Text cannot be extracted directly. "
+                f"Adobe OCR API is not configured. "
+                f"Set ADOBE_CLIENT_ID and ADOBE_CLIENT_SECRET for automatic conversion."
+            )
+
     scanned = is_scanned_pdf(pdf_path)
-    if scanned:
-        logger.info(f"[{job_id}] Scanned/image-based PDF detected — OCR will be used")
+    if scanned and not converted_pdf_path:
+        logger.info(f"[{job_id}] Scanned/image-based PDF detected — Tesseract OCR will be used")
         warnings.append(
             "This PDF appears to be scanned/image-based. OCR was used for text extraction. "
             "Please verify the extracted data carefully as OCR accuracy may vary."
@@ -427,6 +463,14 @@ def _run_extraction(pdf_path: str, job_id: str) -> dict:
 
     create_excel(data, excel_path, job_id=job_id)
     logger.info(f"[{job_id}] Excel generated: {excel_path}")
+
+    # Clean up converted temp PDF if Adobe OCR was used
+    if converted_pdf_path and os.path.exists(converted_pdf_path):
+        try:
+            os.unlink(converted_pdf_path)
+            logger.info(f"[{job_id}] Cleaned up converted PDF: {converted_pdf_path}")
+        except OSError:
+            pass
 
     return {"excel_path": excel_path, "data": data, "warnings": warnings}
 
