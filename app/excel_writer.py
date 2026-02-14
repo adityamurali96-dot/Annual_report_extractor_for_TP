@@ -1,8 +1,10 @@
 """
 Excel output generation with professional formatting.
 Creates a multi-sheet workbook with P&L, metrics, note breakup, validation,
-and header validation for company verification.
+extraction metadata, and header validation for company verification.
 """
+
+from datetime import datetime
 
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
@@ -59,6 +61,7 @@ PNL_ROWS = [
     ('Total Income', 'Total income', False, True),
     ('', None, False, False),
     ('EXPENSES', None, True, False),
+    ('Cost of materials consumed', 'Cost of materials consumed', False, False),
     ('Employee benefits expense', 'Employee benefits expense', False, False),
     ('Cost of professionals', 'Cost of professionals', False, False),
     ('Finance costs', 'Finance costs', False, False),
@@ -113,7 +116,7 @@ def _write_pnl_sheet(wb: Workbook, pnl: dict, fy_current: str, fy_previous: str)
                 cell.font = BOLD_FONT if is_tot else NORMAL_FONT
             if is_tot:
                 ws.cell(row=r, column=1).font = BOLD_FONT
-            ws.cell(row=r, column=4).value = f'=IF(C{r}=0,"-",(B{r}-C{r})/ABS(C{r}))'
+            ws.cell(row=r, column=4).value = f'=IF(C{r}=0,"N/A",(B{r}-C{r})/ABS(C{r}))'
             ws.cell(row=r, column=4).number_format = '0.0%'
             ws.cell(row=r, column=4).font = BLUE_FONT
             ws.cell(row=r, column=4).alignment = Alignment(horizontal='right')
@@ -134,6 +137,7 @@ METRIC_ROWS = [
     ('Total Income', 'Total Income', False, True, False),
     ('', None, False, False, False),
     ('OPERATING EXPENSES', None, True, False, False),
+    ('Cost of Materials Consumed', 'Cost of Materials Consumed', False, False, False),
     ('Employee Benefits Expense', 'Employee Benefits Expense', False, False, False),
     ('Cost of Professionals', 'Cost of Professionals', False, False, False),
     ('Depreciation & Amortisation', 'Depreciation & Amortisation', False, False, False),
@@ -196,7 +200,7 @@ def _write_metrics_sheet(wb: Workbook, metrics: dict, company: str, currency: st
                 ws.cell(row=r, column=4).value = f'=B{r}-C{r}'
                 ws.cell(row=r, column=4).number_format = '0.00" bps"'
             else:
-                ws.cell(row=r, column=4).value = f'=IF(C{r}=0,"-",(B{r}-C{r})/ABS(C{r}))'
+                ws.cell(row=r, column=4).value = f'=IF(C{r}=0,"N/A",(B{r}-C{r})/ABS(C{r}))'
                 ws.cell(row=r, column=4).number_format = '0.0%'
             ws.cell(row=r, column=4).font = BLUE_FONT
             ws.cell(row=r, column=4).alignment = Alignment(horizontal='right')
@@ -250,7 +254,7 @@ def _write_note_sheet(wb: Workbook, pnl: dict, note_items: list, note_total: dic
             cell_b.alignment = Alignment(horizontal='right')
             cell_c.alignment = Alignment(horizontal='right')
 
-            ws.cell(row=r, column=4).value = f'=IF(C{r}=0,"-",(B{r}-C{r})/ABS(C{r}))'
+            ws.cell(row=r, column=4).value = f'=IF(C{r}=0,"N/A",(B{r}-C{r})/ABS(C{r}))'
             ws.cell(row=r, column=4).number_format = '0.0%'
             ws.cell(row=r, column=4).font = BLUE_FONT
             ws.cell(row=r, column=4).alignment = Alignment(horizontal='right')
@@ -425,10 +429,45 @@ def _write_validation_sheet(wb: Workbook, pnl: dict, metrics: dict,
 
 
 # -------------------------------------------------------------------
+# Sheet 5: Extraction Metadata
+# -------------------------------------------------------------------
+
+def _write_metadata_sheet(wb: Workbook, data: dict, job_id: str):
+    """Write extraction metadata for audit/debugging purposes."""
+    ws = wb.create_sheet("Extraction Info")
+    _set_column_widths(ws, {'A': 30, 'B': 50})
+
+    ws['A1'] = "Extraction Metadata"
+    ws['A1'].font = Font(name='Arial', bold=True, size=13, color='2F5496')
+
+    pages = data.get('pages', {})
+    metadata = [
+        ("Extracted On", datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
+        ("Job ID", job_id),
+        ("Company", data.get('company', 'Unknown')),
+        ("Currency Unit", data.get('currency', 'Unknown')),
+        ("Fiscal Year (Current)", data.get('fy_current', '')),
+        ("Fiscal Year (Previous)", data.get('fy_previous', '')),
+        ("P&L Page", f"Page {pages.get('pnl', '?') + 1}" if pages.get('pnl') is not None else "Not identified"),
+        ("Balance Sheet Page", f"Page {pages.get('bs', '?') + 1}" if pages.get('bs') is not None else "Not identified"),
+        ("Cash Flow Page", f"Page {pages.get('cf', '?') + 1}" if pages.get('cf') is not None else "Not identified"),
+        ("Notes Start Page", f"Page {pages.get('notes_start', '?') + 1}" if pages.get('notes_start') is not None else "Not identified"),
+        ("Identification Method", "Claude API" if data.get('claude_identified') else "Regex/Scoring"),
+        ("Warnings", "; ".join(data.get('warnings', [])) or "None"),
+    ]
+
+    for i, (label, value) in enumerate(metadata, start=3):
+        ws.cell(row=i, column=1, value=label).font = BOLD_FONT
+        ws.cell(row=i, column=2, value=str(value)).font = NORMAL_FONT
+        for c in range(1, 3):
+            ws.cell(row=i, column=c).border = LIGHT_BORDER
+
+
+# -------------------------------------------------------------------
 # Public API
 # -------------------------------------------------------------------
 
-def create_excel(data: dict, output_path: str) -> str:
+def create_excel(data: dict, output_path: str, job_id: str = "") -> str:
     """
     Create a formatted Excel workbook from extracted financial data.
 
@@ -436,6 +475,7 @@ def create_excel(data: dict, output_path: str) -> str:
         data: Dict with keys: pnl, note_items, note_total, note_number,
               fy_current, fy_previous, company, currency, pages, page_headers
         output_path: Path to save the Excel file
+        job_id: Optional job identifier for metadata sheet
 
     Returns:
         The output path.
@@ -469,6 +509,7 @@ def create_excel(data: dict, output_path: str) -> str:
     _write_note_sheet(wb, pnl, note_items, note_total, note_num, fy_current, fy_previous)
     _write_validation_sheet(wb, pnl, metrics, note_total, note_num,
                             note_validation, page_headers, pages)
+    _write_metadata_sheet(wb, data, job_id)
 
     wb.save(output_path)
     return output_path

@@ -20,9 +20,27 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir opencv-python-headless && \
     pip install --no-cache-dir -r requirements.txt
 
+# Install curl for health check
+RUN apt-get update -qq && apt-get install -y --no-install-recommends curl && \
+    rm -rf /var/lib/apt/lists/*
+
 COPY . .
 
 # Create uploads directory
 RUN mkdir -p uploads
+
+# Pre-download Docling's table extraction model during build
+# so the first user request doesn't have to wait for model download
+RUN python -c "from docling.document_converter import DocumentConverter; \
+    from docling.datamodel.base_models import InputFormat; \
+    from docling.datamodel.pipeline_options import PdfPipelineOptions, TableFormerMode, TableStructureOptions; \
+    from docling.document_converter import PdfFormatOption; \
+    opts = PdfPipelineOptions(do_table_structure=True, \
+        table_structure_options=TableStructureOptions(mode=TableFormerMode.ACCURATE)); \
+    DocumentConverter(format_options={InputFormat.PDF: PdfFormatOption(pipeline_options=opts)}); \
+    print('Docling models downloaded')"
+
+HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
+    CMD curl -f http://localhost:${PORT:-8000}/health || exit 1
 
 CMD ["sh", "-c", "uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000}"]

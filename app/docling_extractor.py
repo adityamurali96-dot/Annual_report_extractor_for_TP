@@ -6,10 +6,12 @@ Only processes the specific pages identified by Claude API (typically 2 pages),
 making extraction fast and focused.
 """
 
+import atexit
 import logging
 import os
 import re
 import tempfile
+import threading
 
 import fitz
 
@@ -18,10 +20,27 @@ logger = logging.getLogger(__name__)
 # Lazy-initialized converters (heavy import + model download on first use)
 _converter = None
 _converter_ocr = None
+_converter_lock = threading.Lock()
+
+# Track temp files for cleanup on process exit
+_temp_files: list[str] = []
+_temp_files_lock = threading.Lock()
+
+
+@atexit.register
+def _cleanup_temp_files():
+    """Clean up any orphaned temp files on process exit."""
+    for f in _temp_files:
+        try:
+            os.unlink(f)
+        except OSError:
+            pass
 
 
 def _get_converter(use_ocr: bool = False):
     """Lazy-init the Docling DocumentConverter with table extraction enabled.
+
+    Thread-safe via lock to prevent concurrent initialization issues.
 
     Args:
         use_ocr: If True, returns a converter with OCR enabled for scanned PDFs.
@@ -30,59 +49,60 @@ def _get_converter(use_ocr: bool = False):
     """
     global _converter, _converter_ocr
 
-    if use_ocr:
-        if _converter_ocr is not None:
-            return _converter_ocr
-    else:
-        if _converter is not None:
-            return _converter
+    with _converter_lock:
+        if use_ocr:
+            if _converter_ocr is not None:
+                return _converter_ocr
+        else:
+            if _converter is not None:
+                return _converter
 
-    from docling.datamodel.base_models import InputFormat
-    from docling.datamodel.pipeline_options import (
-        PdfPipelineOptions,
-        TableFormerMode,
-        TableStructureOptions,
-    )
-    from docling.document_converter import DocumentConverter, PdfFormatOption
+        from docling.datamodel.base_models import InputFormat
+        from docling.datamodel.pipeline_options import (
+            PdfPipelineOptions,
+            TableFormerMode,
+            TableStructureOptions,
+        )
+        from docling.document_converter import DocumentConverter, PdfFormatOption
 
-    pipeline_options = PdfPipelineOptions(
-        do_table_structure=True,
-        table_structure_options=TableStructureOptions(
-            mode=TableFormerMode.ACCURATE,
-            do_cell_matching=True,
-        ),
-        do_ocr=use_ocr,
-    )
+        pipeline_options = PdfPipelineOptions(
+            do_table_structure=True,
+            table_structure_options=TableStructureOptions(
+                mode=TableFormerMode.ACCURATE,
+                do_cell_matching=True,
+            ),
+            do_ocr=use_ocr,
+        )
 
-    # If OCR is enabled, try to configure OCR options for better accuracy
-    if use_ocr:
-        try:
-            from docling.datamodel.pipeline_options import (
-                EasyOcrOptions,
-                OcrOptions,
-            )
-            ocr_options = EasyOcrOptions(
-                lang=["en"],  # English for financial statements
-                use_gpu=False,  # CPU-only for compatibility
-            )
-            pipeline_options.ocr_options = ocr_options
-            logger.info("Docling OCR configured with EasyOCR (English)")
-        except (ImportError, Exception) as e:
-            # Docling's built-in OCR will be used as default
-            logger.info(f"Using Docling default OCR config: {e}")
+        # If OCR is enabled, try to configure OCR options for better accuracy
+        if use_ocr:
+            try:
+                from docling.datamodel.pipeline_options import (
+                    EasyOcrOptions,
+                    OcrOptions,
+                )
+                ocr_options = EasyOcrOptions(
+                    lang=["en"],  # English for financial statements
+                    use_gpu=False,  # CPU-only for compatibility
+                )
+                pipeline_options.ocr_options = ocr_options
+                logger.info("Docling OCR configured with EasyOCR (English)")
+            except (ImportError, Exception) as e:
+                # Docling's built-in OCR will be used as default
+                logger.info(f"Using Docling default OCR config: {e}")
 
-    converter = DocumentConverter(
-        format_options={
-            InputFormat.PDF: PdfFormatOption(pipeline_options=pipeline_options),
-        }
-    )
+        converter = DocumentConverter(
+            format_options={
+                InputFormat.PDF: PdfFormatOption(pipeline_options=pipeline_options),
+            }
+        )
 
-    if use_ocr:
-        _converter_ocr = converter
-    else:
-        _converter = converter
+        if use_ocr:
+            _converter_ocr = converter
+        else:
+            _converter = converter
 
-    return converter
+        return converter
 
 
 # -------------------------------------------------------------------
@@ -100,6 +120,8 @@ def _create_page_subset_pdf(pdf_path: str, page_indices: list[int]) -> str:
     dst.save(tmp.name)
     dst.close()
     src.close()
+    with _temp_files_lock:
+        _temp_files.append(tmp.name)
     return tmp.name
 
 
@@ -112,6 +134,7 @@ def _parse_number(s) -> float | None:
 
     Returns None for truly empty cells (no data).
     Returns 0.0 for explicit zero markers (dash, Nil).
+    Handles OCR artifacts like 'O' for '0' and 'l' for '1'.
     """
     if s is None:
         return None
@@ -122,10 +145,22 @@ def _parse_number(s) -> float | None:
     # Explicit zero markers — means zero
     if s in ['-', '\u2014', '\u2013', 'Nil', 'nil', '- ', '\u2012']:
         return 0.0
-    s = s.replace(',', '').replace(' ', '').replace('\u00a0', '')
+    # Handle parentheses for negative numbers
     neg = s.startswith('(') and s.endswith(')')
     if neg:
         s = s[1:-1]
+    # Remove spaces and non-breaking spaces
+    s = s.replace(' ', '').replace('\u00a0', '')
+    # Handle Indian numbering (1,23,456.78) and standard (123,456.78)
+    s = s.replace(',', '')
+    # Handle OCR artifacts: 'O' instead of '0', 'l' instead of '1'
+    # Only apply if the string is mostly numeric already
+    alpha_count = sum(1 for c in s if c.isalpha())
+    if alpha_count <= 2:
+        s = s.replace('O', '0').replace('o', '0')
+        s = s.replace('l', '1').replace('I', '1')
+    else:
+        return None  # Too many letters, probably not a number
     try:
         val = float(s)
         return -val if neg else val
@@ -566,7 +601,7 @@ def extract_pnl_docling(pdf_path: str, pnl_page: int) -> dict:
 
     return {
         'company': company,
-        'currency': 'INR Million',
+        'currency': 'INR (unit not detected)',
         'items': extracted,
         'note_refs': note_refs,
         'operating_expense_label': oe_actual_label,

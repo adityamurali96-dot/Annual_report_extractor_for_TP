@@ -554,7 +554,8 @@ def extract_pnl_regex(pdf_path: str, page_idx: int) -> dict:
 # -------------------------------------------------------------------
 
 def find_note_page(pdf_path: str, note_number: str, search_start_page: int,
-                   search_keyword: str = "Other expenses") -> tuple[int | None, int | None]:
+                   search_keyword: str = "Other expenses",
+                   max_pages_to_search: int = 80) -> tuple[int | None, int | None]:
     """
     Find the PDF page containing a specific note number.
 
@@ -562,8 +563,12 @@ def find_note_page(pdf_path: str, note_number: str, search_start_page: int,
       1. Note number + keyword on the same line (e.g., "27. Other expenses")
       2. Note number at start of line with keyword within nearby lines (±4)
       3. Broader search for the note number heading on any notes page
+
+    Limits search to max_pages_to_search pages after search_start_page
+    to avoid scanning the entire PDF and false-matching on random content.
     """
     doc = fitz.open(pdf_path)
+    search_end = min(search_start_page + max_pages_to_search, doc.page_count)
     keyword_lower = search_keyword.lower()
     note_esc = re.escape(note_number)
 
@@ -577,7 +582,7 @@ def find_note_page(pdf_path: str, note_number: str, search_start_page: int,
         re.compile(keyword_lower + rf'.*\b{note_esc}\b', re.IGNORECASE),
     ]
 
-    for i in range(search_start_page, doc.page_count):
+    for i in range(search_start_page, search_end):
         text = doc[i].get_text()
         lines = [l.strip() for l in text.split('\n')]
         for j, line in enumerate(lines):
@@ -591,7 +596,7 @@ def find_note_page(pdf_path: str, note_number: str, search_start_page: int,
         rf'^\s*{note_esc}\s*[.\-–—:)]\s', re.IGNORECASE
     )
 
-    for i in range(search_start_page, doc.page_count):
+    for i in range(search_start_page, search_end):
         text = doc[i].get_text()
         lines = [l.strip() for l in text.split('\n')]
         for j, line in enumerate(lines):
@@ -604,7 +609,7 @@ def find_note_page(pdf_path: str, note_number: str, search_start_page: int,
                     return i, j
 
     # ------- Strategy 3: page-level search (note number + keyword anywhere) -------
-    for i in range(search_start_page, doc.page_count):
+    for i in range(search_start_page, search_end):
         text = doc[i].get_text()
         lower_text = text.lower()
         if keyword_lower not in lower_text:
@@ -629,7 +634,7 @@ def find_note_page(pdf_path: str, note_number: str, search_start_page: int,
         rf'(?:^|\n)\s*(?:note\s*)?{note_esc}\s*[.\-–—:)]\s+[A-Za-z]',
         re.IGNORECASE | re.MULTILINE,
     )
-    for i in range(search_start_page, doc.page_count):
+    for i in range(search_start_page, search_end):
         text = doc[i].get_text()
         m = note_heading_re.search(text)
         if m:
@@ -642,7 +647,7 @@ def find_note_page(pdf_path: str, note_number: str, search_start_page: int,
     # ------- Strategy 5: keyword on page in notes section -------
     # If the note number heading is absent (no heading), just find a page
     # in the notes section that mentions the keyword "Other expenses".
-    for i in range(search_start_page, doc.page_count):
+    for i in range(search_start_page, search_end):
         text = doc[i].get_text()
         lower_text = text.lower()
         if keyword_lower in lower_text and 'expense' in lower_text:
@@ -729,15 +734,22 @@ def extract_note_breakup(pdf_path: str, page_idx: int, start_line: int,
 def validate_note_extraction(pnl: dict, note_items: list,
                               note_total: dict | None,
                               note_num: str | None,
-                              tolerance: float = 1.0) -> list[dict]:
+                              tolerance: float | None = None) -> list[dict]:
     """
     Validate the extracted note breakup against P&L figures.
+
+    Tolerance is dynamic by default: 0.1% of the P&L value (minimum 1.0).
+    This handles rounding differences between notes and P&L.
 
     Returns a list of check dicts:
         [{"name": str, "actual": float, "expected": float, "ok": bool}, ...]
     """
     items = pnl.get('items', {})
     pnl_oe_cy = items.get('Other expenses', {}).get('current', 0) or 0
+
+    # Dynamic tolerance: 0.1% of the value, minimum 1.0
+    if tolerance is None:
+        tolerance = max(1.0, abs(pnl_oe_cy) * 0.001)
     pnl_oe_py = items.get('Other expenses', {}).get('previous', 0) or 0
 
     note_total_cy = (note_total.get('current', 0) or 0) if note_total else 0
