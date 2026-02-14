@@ -8,3 +8,4 @@ opencv-python-headless==4.9.0.80
 docling>=2.31.0,<3.0.0
 anthropic>=0.42.0,<1.0.0
 easyocr>=1.7.0,<2.0.0
+pdfservices-sdk>=4.0.0
