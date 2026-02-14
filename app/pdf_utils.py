@@ -45,44 +45,67 @@ def is_value_line(s: str) -> bool:
         return False
 
 
-def is_scanned_pdf(pdf_path: str, sample_pages: int = 10) -> bool:
+def is_page_scanned(page) -> bool:
+    """Check if a SINGLE page is scanned (image-based with little text).
+
+    Used during page-level extraction to decide whether individual pages
+    need OCR, even if the overall PDF is text-based (hybrid PDFs).
+    """
+    text = page.get_text().strip()
+    images = page.get_images(full=True)
+    word_count = len(text.split())
+    return word_count < 20 and len(images) > 0
+
+
+def is_scanned_pdf(pdf_path: str, sample_pages: int = 20) -> bool:
     """Detect if a PDF is scanned (image-based) vs text-based.
 
-    Samples up to `sample_pages` pages and checks the ratio of pages
-    with very little extractable text. A scanned PDF typically has
-    pages with almost no selectable text but many images.
+    Samples pages from three zones (front, middle, back) to catch
+    hybrid PDFs where financials in the middle may be scanned while
+    front matter is text-based.
 
     Returns True if the PDF appears to be scanned/image-based.
     """
     doc = fitz.open(pdf_path)
-    total = min(doc.page_count, sample_pages)
+    total = doc.page_count
     if total == 0:
         doc.close()
         return False
 
+    # Sample from three zones:
+    # - First 5 pages (front matter)
+    # - Middle 10 pages (where financials usually are)
+    # - Last 5 pages (notes section)
+    sample_indices = set()
+
+    # Front
+    for i in range(min(5, total)):
+        sample_indices.add(i)
+
+    # Middle
+    mid = total // 2
+    for i in range(max(0, mid - 5), min(total, mid + 5)):
+        sample_indices.add(i)
+
+    # Back
+    for i in range(max(0, total - 5), total):
+        sample_indices.add(i)
+
     low_text_pages = 0
     image_pages = 0
 
-    # Sample pages evenly distributed through the document
-    step = max(1, doc.page_count // total)
-    sampled = 0
-
-    for i in range(0, doc.page_count, step):
-        if sampled >= total:
-            break
+    for i in sorted(sample_indices):
         page = doc[i]
         text = page.get_text().strip()
         images = page.get_images(full=True)
-
-        # A page with very little text but images is likely scanned
         word_count = len(text.split())
         if word_count < 20:
             low_text_pages += 1
         if images:
             image_pages += 1
-        sampled += 1
 
     doc.close()
+    sampled = len(sample_indices)
 
     if sampled == 0:
         return False
@@ -93,8 +116,10 @@ def is_scanned_pdf(pdf_path: str, sample_pages: int = 10) -> bool:
     # If most pages have little text AND contain images → scanned
     is_scanned = low_text_ratio >= 0.5 and image_ratio >= 0.5
     if is_scanned:
-        logger.info(f"PDF detected as scanned: {low_text_ratio:.0%} low-text pages, "
-                     f"{image_ratio:.0%} image pages (sampled {sampled} pages)")
+        logger.info(
+            f"PDF detected as scanned: {low_text_ratio:.0%} low-text, "
+            f"{image_ratio:.0%} images (sampled {sampled}/{total} pages)"
+        )
     return is_scanned
 
 
@@ -116,15 +141,20 @@ def extract_pdf_text(pdf_path: str, force_ocr: bool = False) -> list[dict]:
         page = doc[i]
         text = page.get_text()
 
-        # For scanned pages with little text, try OCR via PyMuPDF
-        if scanned and len(text.strip().split()) < 20:
+        # Per-page OCR check — catches hybrid PDFs where only some pages
+        # are scanned (e.g. text-based director's report + scanned financials)
+        if (scanned or is_page_scanned(page)) and len(text.strip().split()) < 20:
             try:
-                # PyMuPDF supports OCR via Tesseract if installed
-                ocr_text = page.get_text("text", flags=fitz.TEXT_PRESERVE_WHITESPACE)
+                # Actual OCR via PyMuPDF's Tesseract integration.
+                # full=False means "only OCR image areas where no text exists"
+                # so for normal PDFs it does nothing (fast), and for scanned
+                # PDFs it runs Tesseract on the whole page image.
+                tp = page.get_textpage_ocr(language="eng", dpi=150, full=False)
+                ocr_text = page.get_text(textpage=tp)
                 if len(ocr_text.strip()) > len(text.strip()):
                     text = ocr_text
-            except Exception:
-                pass  # Tesseract not available, use whatever we have
+            except Exception as e:
+                logger.warning(f"Tesseract OCR unavailable for page {i}: {e}")
 
         pages.append({
             "page": i,

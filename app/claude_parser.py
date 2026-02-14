@@ -10,13 +10,14 @@ All data extraction (P&L parsing, note breakup) is done via pymupdf4llm/regex.
 
 import json
 import logging
+import os
 
 from app.config import ANTHROPIC_API_KEY
 from app.pdf_utils import extract_pdf_text
 
 logger = logging.getLogger(__name__)
 
-CLAUDE_MODEL = "claude-sonnet-4-5-20250929"
+CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "claude-sonnet-4-5-20250929")
 
 try:
     import anthropic
@@ -123,15 +124,32 @@ def identify_pages(pdf_path: str) -> dict:
     all_pages = extract_pdf_text(pdf_path)
 
     # Build a condensed view of each page.
-    # Use first 20 lines to capture more context (some reports have
-    # multi-line headers, date ranges, and currency info before content).
+    # Take 25 meaningful lines from the first 40 raw lines to skip
+    # blank lines from headers/logos common in OCR'd documents.
     page_summaries = []
+    empty_page_count = 0
+
     for p in all_pages:
-        lines = p["text"].split('\n')[:20]
-        summary = '\n'.join(lines)
-        # Skip completely empty pages (scanned pages with no OCR text)
+        raw_lines = p["text"].split('\n')
+        non_empty = [l for l in raw_lines[:40] if l.strip()][:25]
+        summary = '\n'.join(non_empty)
         if summary.strip():
             page_summaries.append(f"=== PAGE {p['page']} ===\n{summary}")
+        else:
+            empty_page_count += 1
+
+    # If most pages are empty, the PDF is likely scanned without OCR
+    if empty_page_count > len(all_pages) * 0.8:
+        logger.error(
+            f"[identify_pages] {empty_page_count}/{len(all_pages)} pages "
+            f"have no extractable text. PDF may be scanned without OCR."
+        )
+        raise ValueError(
+            f"Cannot identify financial statement pages: "
+            f"{empty_page_count} of {len(all_pages)} pages have no readable text. "
+            f"This PDF appears to be scanned/image-based. "
+            f"Please ensure Tesseract OCR is installed, or use a text-based PDF."
+        )
 
     # Send in batches if too many pages
     batch_size = 80
@@ -144,6 +162,7 @@ def identify_pages(pdf_path: str) -> dict:
         response = client.messages.create(
             model=CLAUDE_MODEL,
             max_tokens=1024,
+            timeout=30.0,
             messages=[
                 {"role": "user", "content": f"{IDENTIFY_PAGES_PROMPT}\n\nHere are the page summaries:\n\n{content}"}
             ],

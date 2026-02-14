@@ -8,8 +8,11 @@ Pipeline (PDF-only, supports batch of up to 2 reports):
   4. Return Excel file(s) with warnings if multiple standalone sections detected
 """
 
+import asyncio
 import logging
+import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import List
 
@@ -33,6 +36,18 @@ app = FastAPI(
 BASE_DIR = Path(__file__).resolve().parent.parent
 app.mount("/static", StaticFiles(directory=str(BASE_DIR / "static")), name="static")
 templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
+
+# Thread pool for running blocking extraction in background threads
+executor = ThreadPoolExecutor(max_workers=2)
+
+
+def _cleanup_old_files(max_age_seconds: int = 3600):
+    """Delete output files older than max_age_seconds (default 1 hour)."""
+    now = time.time()
+    for f in UPLOAD_DIR.iterdir():
+        if f.suffix == '.xlsx' and (now - f.stat().st_mtime) > max_age_seconds:
+            f.unlink(missing_ok=True)
+            logger.info(f"Cleaned up old file: {f.name}")
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -62,6 +77,8 @@ async def extract(files: List[UploadFile] = File(...)):
     if not files or len(files) > 2:
         raise HTTPException(400, "Please upload 1 or 2 PDF files")
 
+    _cleanup_old_files()
+
     results = []
 
     for file in files:
@@ -72,10 +89,22 @@ async def extract(files: List[UploadFile] = File(...)):
         if ext != ".pdf":
             raise HTTPException(400, f"Only PDF files are accepted, got '{ext}' for {file.filename}")
 
-        content = await file.read()
+        # Read file in chunks to avoid loading huge files into memory
+        content = bytearray()
+        max_bytes = MAX_UPLOAD_SIZE_MB * 1024 * 1024
+        chunk_size = 1024 * 1024  # 1MB chunks
+        while True:
+            chunk = await file.read(chunk_size)
+            if not chunk:
+                break
+            content.extend(chunk)
+            if len(content) > max_bytes:
+                raise HTTPException(
+                    400,
+                    f"File too large. Maximum is {MAX_UPLOAD_SIZE_MB}MB."
+                )
+        content = bytes(content)
         size_mb = len(content) / (1024 * 1024)
-        if size_mb > MAX_UPLOAD_SIZE_MB:
-            raise HTTPException(400, f"File too large ({size_mb:.1f}MB). Max is {MAX_UPLOAD_SIZE_MB}MB")
 
         job_id = str(uuid.uuid4())[:8]
         pdf_path = UPLOAD_DIR / f"{job_id}.pdf"
@@ -84,7 +113,13 @@ async def extract(files: List[UploadFile] = File(...)):
         logger.info(f"[{job_id}] Received {file.filename} ({size_mb:.1f}MB)")
 
         try:
-            result = _run_extraction(str(pdf_path), job_id)
+            loop = asyncio.get_event_loop()
+            result = await loop.run_in_executor(
+                executor,
+                _run_extraction,
+                str(pdf_path),
+                job_id,
+            )
             excel_path = result["excel_path"]
             download_name = f"{Path(file.filename).stem}_financials.xlsx"
 
@@ -95,11 +130,24 @@ async def extract(files: List[UploadFile] = File(...)):
                 "excel_path": excel_path,
                 "warnings": result.get("warnings", []),
             })
-        except Exception as e:
-            logger.exception(f"[{job_id}] Extraction failed for {file.filename}")
+        except ValueError as e:
+            # ValueError = known failures (no P&L found, no tables, etc.)
+            logger.warning(f"[{job_id}] Known failure for {file.filename}: {e}")
             if pdf_path.exists():
                 pdf_path.unlink()
-            raise HTTPException(500, f"Extraction failed for {file.filename}: {str(e)}") from e
+            raise HTTPException(
+                422,
+                f"{file.filename}: {str(e)}"
+            ) from e
+        except Exception as e:
+            logger.exception(f"[{job_id}] Unexpected error for {file.filename}")
+            if pdf_path.exists():
+                pdf_path.unlink()
+            raise HTTPException(
+                500,
+                f"{file.filename}: An unexpected error occurred. "
+                f"Please try a different PDF or contact support."
+            ) from e
         finally:
             if pdf_path.exists():
                 pdf_path.unlink()
@@ -183,6 +231,7 @@ def _run_extraction(pdf_path: str, job_id: str) -> dict:
     fy_previous = "FY Previous"
     pages = {}
     company_name = None
+    currency = None
     claude_identified = False
 
     if ANTHROPIC_API_KEY:
@@ -195,6 +244,7 @@ def _run_extraction(pdf_path: str, job_id: str) -> dict:
             fy_current = page_info.get("fiscal_year_current", fy_current)
             fy_previous = page_info.get("fiscal_year_previous", fy_previous)
             company_name = page_info.get("company_name")
+            currency = page_info.get("currency")
 
             if raw_pages.get("pnl") is not None:
                 pages["pnl"] = raw_pages["pnl"]
@@ -282,9 +332,22 @@ def _run_extraction(pdf_path: str, job_id: str) -> dict:
     # Step 3: Docling extracts P&L from targeted page(s)
     # ------------------------------------------------------------------
     logger.info(f"[{job_id}] Docling extracting P&L from page {pages['pnl']}")
-    pnl = extract_pnl_docling(pdf_path, pages["pnl"])
+    try:
+        pnl = extract_pnl_docling(pdf_path, pages["pnl"])
+    except Exception as e:
+        logger.warning(f"[{job_id}] Docling failed: {e}, trying pymupdf4llm fallback")
+        pnl = None
 
-    if not pnl.get('items'):
+    # Fallback to pymupdf4llm-based extraction if Docling fails or extracts nothing
+    if not pnl or not pnl.get('items'):
+        try:
+            from app.table_extractor import extract_pnl_from_tables
+            logger.info(f"[{job_id}] Using pymupdf4llm fallback for P&L extraction")
+            pnl = extract_pnl_from_tables(pdf_path, pages["pnl"])
+        except Exception as e2:
+            logger.warning(f"[{job_id}] pymupdf4llm fallback also failed: {e2}")
+
+    if not pnl or not pnl.get('items'):
         raise ValueError(
             f"Could not extract any P&L line items from page {pages['pnl']}. "
             f"The PDF table structure may not be supported."
@@ -292,6 +355,8 @@ def _run_extraction(pdf_path: str, job_id: str) -> dict:
 
     if company_name:
         pnl['company'] = company_name
+    if currency:
+        pnl['currency'] = currency
 
     logger.info(f"[{job_id}] Docling P&L: {len(pnl['items'])} items - "
                 f"{list(pnl['items'].keys())}")
@@ -357,9 +422,10 @@ def _run_extraction(pdf_path: str, job_id: str) -> dict:
         "note_validation": validation,
         "page_headers": page_headers,
         "warnings": warnings,
+        "claude_identified": claude_identified,
     }
 
-    create_excel(data, excel_path)
+    create_excel(data, excel_path, job_id=job_id)
     logger.info(f"[{job_id}] Excel generated: {excel_path}")
 
     return {"excel_path": excel_path, "data": data, "warnings": warnings}

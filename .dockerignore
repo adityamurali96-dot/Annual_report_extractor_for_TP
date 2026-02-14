@@ -1,0 +1,12 @@
+.git
+.gitignore
+uploads/
+*.pyc
+__pycache__
+.env
+.env.local
+.vscode
+.idea
+README.md
+*.xlsx
+*.pdf

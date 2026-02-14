@@ -134,12 +134,16 @@
         });
 
         function handleFiles(files) {
-            const pdfs = files.filter(f => f.name.toLowerCase().endsWith('.pdf')).slice(0, 2);
-            if (pdfs.length === 0) {
+            const allPdfs = files.filter(f => f.name.toLowerCase().endsWith('.pdf'));
+            if (allPdfs.length === 0) {
                 showError('Please select PDF file(s)');
                 return;
             }
-            selectedFiles = pdfs;
+            if (allPdfs.length > 2) {
+                showError(`Maximum 2 files allowed. You selected ${allPdfs.length}.`);
+                return;
+            }
+            selectedFiles = allPdfs;
             renderFileList();
             dropZone.style.display = 'none';
             extractBtn.disabled = false;
@@ -200,17 +204,24 @@
             const formData = new FormData();
             selectedFiles.forEach(f => formData.append('files', f));
 
+            let timer = null;
             try {
                 updateStep(2);
-                processingText.textContent = 'Identifying standalone sections...';
+                processingText.textContent = 'Processing... (this may take 30-60 seconds)';
 
-                updateStep(3);
-                processingText.textContent = 'Extracting data...';
+                // Show elapsed time while waiting
+                const startTime = Date.now();
+                timer = setInterval(() => {
+                    const elapsed = Math.round((Date.now() - startTime) / 1000);
+                    processingText.textContent = `Processing... ${elapsed}s elapsed`;
+                }, 1000);
 
                 const response = await fetch('/extract', {
                     method: 'POST',
                     body: formData,
                 });
+
+                clearInterval(timer);
 
                 if (!response.ok) {
                     const err = await response.json();
@@ -255,6 +266,7 @@
                 }
 
             } catch (err) {
+                if (timer) clearInterval(timer);
                 processingSection.style.display = 'none';
                 showError(err.message);
             }
