@@ -50,6 +50,11 @@
                     <strong>Note:</strong> Claude API key not configured. Page detection uses regex pattern matching. Optionally set <code>ANTHROPIC_API_KEY</code> for improved page identification in non-standard report layouts.
                 </div>
                 {% endif %}
+                {% if not has_adobe_ocr %}
+                <div class="warning-box">
+                    <strong>Note:</strong> Adobe OCR not configured. Scanned PDFs and PDFs with outlined fonts cannot be processed. Set <code>ADOBE_CLIENT_ID</code> and <code>ADOBE_CLIENT_SECRET</code> to enable automatic OCR conversion.
+                </div>
+                {% endif %}
             </div>
 
             <div class="processing-section" id="processingSection" style="display:none;">

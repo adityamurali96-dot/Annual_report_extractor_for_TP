@@ -130,13 +130,17 @@ def classify_pdf(pdf_path: str) -> str:
     'text'             — Normal PDF. page.get_text() works.
     'scanned'          — Each page is a full-page photograph/scan.
                          page.get_text() returns nothing.
-                         page.get_images() returns big images.
+                         page.get_images() returns large images.
     'vector_outlined'  — Text converted to vector shapes (Bezier curves).
                          page.get_text() returns nothing.
-                         page.get_images() returns nothing either.
+                         page.get_images() may return nothing or small images.
                          Content streams are huge (curves drawing letters).
 
     Samples pages from front, middle, and back-quarter of the document.
+
+    Key design: vector check runs BEFORE image check, because vector-outlined
+    PDFs may contain small decorative images (logos, borders) that would
+    otherwise cause a false "scanned" classification.
     """
     doc = fitz.open(pdf_path)
     total = doc.page_count
@@ -175,22 +179,42 @@ def classify_pdf(pdf_path: str) -> str:
             text_pages += 1
             continue
 
-        # Check 2: Does it have images? (scanned page)
-        images = page.get_images(full=True)
-        if len(images) > 0:
-            image_pages += 1
-            continue
-
-        # Check 3: Does it have heavy vector content? (outlined fonts)
-        # Lots of drawing commands but no text and no images means every
-        # character was converted to Bezier curves.
+        # Check 2: Heavy vector content? (outlined fonts)
+        # We check this BEFORE images because vector-outlined PDFs often
+        # contain small decorative images (logos, watermarks, borders) that
+        # would cause a false "scanned" classification if checked first.
         stream_bytes = 0
         for s_xref in page.get_contents():
             raw = doc.xref_stream(s_xref)
             if raw:
                 stream_bytes += len(raw)
-        if stream_bytes > 50_000:  # > 50 KB of vector drawing data
+        if stream_bytes > 30_000:  # > 30 KB of vector drawing data
             vector_pages += 1
+            logger.debug(
+                f"[classify_pdf] Page {i}: vector ({stream_bytes:,} bytes content stream)"
+            )
+            continue
+
+        # Check 3: Does it have large images? (scanned page)
+        # Only count as scanned if images are substantial (full-page scans).
+        # Small images (<50KB) are likely logos/decorations, not page scans.
+        images = page.get_images(full=True)
+        if len(images) > 0:
+            has_large_image = False
+            for img in images:
+                try:
+                    xref = img[0]
+                    img_info = doc.extract_image(xref)
+                    if img_info and len(img_info.get("image", b"")) > 50_000:
+                        has_large_image = True
+                        break
+                except Exception:
+                    # Can't extract image info — assume it's significant
+                    has_large_image = True
+                    break
+            if has_large_image:
+                image_pages += 1
+                continue
 
     doc.close()
     sampled = len(sample_indices)
@@ -200,13 +224,20 @@ def classify_pdf(pdf_path: str) -> str:
         f"text={text_pages}, scanned={image_pages}, vector={vector_pages}"
     )
 
-    # Decision logic
-    if text_pages >= sampled * 0.4:
+    # Decision logic:
+    # If majority of pages have text → normal PDF
+    if text_pages > sampled * 0.5:
         return "text"
-    if vector_pages > image_pages:
+    # If any vector pages detected and they outnumber or equal image pages
+    if vector_pages > 0 and vector_pages >= image_pages:
         return "vector_outlined"
+    # If scanned pages found
     if image_pages > 0:
         return "scanned"
+    # If almost no pages have text but we couldn't determine why → vector
+    # (this catches edge cases where content streams are borderline)
+    if text_pages < sampled * 0.3 and sampled > 0:
+        return "vector_outlined"
     # Default: treat as text and let the existing pipeline try
     return "text"
 

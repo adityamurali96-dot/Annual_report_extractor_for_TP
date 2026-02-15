@@ -54,16 +54,23 @@ def _cleanup_old_files(max_age_seconds: int = 3600):
 @app.get("/", response_class=HTMLResponse)
 async def index(request: Request):
     """Serve the upload page."""
+    from app.adobe_converter import is_adobe_available
     return templates.TemplateResponse("index.html", {
         "request": request,
         "has_api_key": bool(ANTHROPIC_API_KEY),
+        "has_adobe_ocr": is_adobe_available(),
     })
 
 
 @app.get("/health")
 async def health():
     """Health check for Railway."""
-    return {"status": "ok", "api_key_configured": bool(ANTHROPIC_API_KEY)}
+    from app.adobe_converter import is_adobe_available
+    return {
+        "status": "ok",
+        "api_key_configured": bool(ANTHROPIC_API_KEY),
+        "adobe_ocr_configured": is_adobe_available(),
+    }
 
 
 @app.post("/extract")
@@ -133,11 +140,21 @@ async def extract(files: List[UploadFile] = File(...)):
             })
         except ValueError as e:
             # ValueError = known failures (no P&L found, no tables, etc.)
+            # These already contain comprehensive diagnostic info
             logger.warning(f"[{job_id}] Known failure for {file.filename}: {e}")
             if pdf_path.exists():
                 pdf_path.unlink()
             raise HTTPException(
                 422,
+                f"{file.filename}: {str(e)}"
+            ) from e
+        except RuntimeError as e:
+            # RuntimeError = configuration issues (missing SDK, bad credentials)
+            logger.error(f"[{job_id}] Configuration error for {file.filename}: {e}")
+            if pdf_path.exists():
+                pdf_path.unlink()
+            raise HTTPException(
+                500,
                 f"{file.filename}: {str(e)}"
             ) from e
         except Exception as e:
@@ -146,7 +163,7 @@ async def extract(files: List[UploadFile] = File(...)):
                 pdf_path.unlink()
             raise HTTPException(
                 500,
-                f"{file.filename}: An unexpected error occurred. "
+                f"{file.filename}: An unexpected error occurred ({type(e).__name__}). "
                 f"Please try a different PDF or contact support."
             ) from e
         finally:
@@ -330,10 +347,53 @@ def _run_extraction(pdf_path: str, job_id: str) -> dict:
             logger.info(f"[{job_id}] Content scoring found P&L at page {scored_pages.get('pnl', '?')}")
 
     if "pnl" not in pages:
-        raise ValueError(
-            "Could not find a P&L (Statement of Profit and Loss) page. "
-            "Please ensure the PDF is an annual report with financial statements."
+        # Build a comprehensive error message explaining what was tried
+        _diag_parts = []
+        _diag_parts.append(
+            "Could not find a P&L (Statement of Profit and Loss) page."
         )
+        _diag_parts.append(f"PDF type detected: {pdf_type}.")
+
+        if pdf_type in ("scanned", "vector_outlined"):
+            type_label = {
+                "scanned": "scanned/image-based",
+                "vector_outlined": "vector-outlined (fonts converted to shapes)",
+            }.get(pdf_type, pdf_type)
+            if converted_pdf_path:
+                _diag_parts.append(
+                    f"Adobe OCR was used to convert this {type_label} PDF, "
+                    f"but the converted text still did not contain recognizable "
+                    f"financial statement titles."
+                )
+            elif is_adobe_available():
+                _diag_parts.append(
+                    f"This PDF is {type_label} and Adobe OCR conversion failed. "
+                    f"The original PDF has no extractable text for page identification."
+                )
+            else:
+                _diag_parts.append(
+                    f"This PDF is {type_label} — text cannot be extracted directly. "
+                    f"Adobe OCR API is not configured. "
+                    f"Set ADOBE_CLIENT_ID and ADOBE_CLIENT_SECRET environment variables "
+                    f"to enable automatic conversion of non-text PDFs."
+                )
+        else:
+            _diag_parts.append(
+                "The PDF appears to be text-based but no financial statement "
+                "titles were found by any identification method."
+            )
+
+        methods_tried = ["Claude API"] if ANTHROPIC_API_KEY else []
+        methods_tried.append("regex title matching")
+        methods_tried.append("content-based scoring")
+        _diag_parts.append(
+            f"Methods tried: {', '.join(methods_tried)}."
+        )
+
+        if warnings:
+            _diag_parts.append(f"Warnings: {'; '.join(warnings)}")
+
+        raise ValueError(" ".join(_diag_parts))
 
     # ------------------------------------------------------------------
     # Step 1b: Check for multiple standalone P&L candidates and warn
@@ -384,10 +444,29 @@ def _run_extraction(pdf_path: str, job_id: str) -> dict:
             logger.warning(f"[{job_id}] pymupdf4llm fallback also failed: {e2}")
 
     if not pnl or not pnl.get('items'):
-        raise ValueError(
-            f"Could not extract any P&L line items from page {pages['pnl']}. "
-            f"The PDF table structure may not be supported."
-        )
+        _extract_diag = [
+            f"Could not extract any P&L line items from page {pages['pnl'] + 1}.",
+            f"PDF type: {pdf_type}.",
+        ]
+        if converted_pdf_path:
+            _extract_diag.append(
+                "Adobe OCR was used to convert the PDF, but the table structure "
+                "could not be parsed by either Docling or pymupdf4llm."
+            )
+        elif pdf_type in ("scanned", "vector_outlined"):
+            _extract_diag.append(
+                "The PDF has no extractable text. Table extraction requires "
+                "readable text. Configure Adobe OCR (ADOBE_CLIENT_ID / "
+                "ADOBE_CLIENT_SECRET) to convert this PDF automatically."
+            )
+        else:
+            _extract_diag.append(
+                "Both Docling and pymupdf4llm failed to extract tables. "
+                "The PDF table layout may be unsupported."
+            )
+        if warnings:
+            _extract_diag.append(f"Warnings: {'; '.join(warnings)}")
+        raise ValueError(" ".join(_extract_diag))
 
     if company_name:
         pnl['company'] = company_name
