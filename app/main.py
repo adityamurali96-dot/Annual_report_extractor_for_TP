@@ -257,16 +257,24 @@ def _run_extraction(pdf_path: str, job_id: str) -> dict:
                 )
             except Exception as e:
                 logger.error(f"[{job_id}] Adobe OCR failed: {e}")
-                warnings.append(
-                    f"Adobe OCR conversion failed ({str(e)[:100]}). "
-                    f"Attempting extraction on original PDF."
-                )
+                raise ValueError(
+                    f"This PDF is {type_label} and cannot be read directly. "
+                    f"Adobe OCR conversion was attempted but failed: {str(e)[:150]}. "
+                    f"Please try re-uploading, or use a text-based PDF."
+                ) from e
         else:
-            logger.warning(f"[{job_id}] PDF is {type_label} but Adobe API not configured.")
-            warnings.append(
-                f"PDF detected as {type_label}. Text cannot be extracted directly. "
-                f"Adobe OCR API is not configured. "
-                f"Set ADOBE_CLIENT_ID and ADOBE_CLIENT_SECRET for automatic conversion."
+            # No Adobe credentials — fail immediately with clear instructions.
+            # There's no point trying regex/Claude on a PDF with no text.
+            logger.error(
+                f"[{job_id}] PDF is {type_label} but Adobe OCR is not configured. "
+                f"Cannot proceed."
+            )
+            raise ValueError(
+                f"This PDF is {type_label} — it contains no extractable text. "
+                f"To process this type of PDF, configure Adobe OCR by setting "
+                f"ADOBE_CLIENT_ID and ADOBE_CLIENT_SECRET environment variables in Railway. "
+                f"Get free credentials (500 documents/month) at: "
+                f"https://acrobatservices.adobe.com/dc-integration-creation-app-cdn/main.html"
             )
 
     scanned = is_scanned_pdf(pdf_path)
@@ -347,53 +355,31 @@ def _run_extraction(pdf_path: str, job_id: str) -> dict:
             logger.info(f"[{job_id}] Content scoring found P&L at page {scored_pages.get('pnl', '?')}")
 
     if "pnl" not in pages:
-        # Build a comprehensive error message explaining what was tried
-        _diag_parts = []
-        _diag_parts.append(
-            "Could not find a P&L (Statement of Profit and Loss) page."
-        )
-        _diag_parts.append(f"PDF type detected: {pdf_type}.")
-
-        if pdf_type in ("scanned", "vector_outlined"):
-            type_label = {
-                "scanned": "scanned/image-based",
-                "vector_outlined": "vector-outlined (fonts converted to shapes)",
-            }.get(pdf_type, pdf_type)
-            if converted_pdf_path:
-                _diag_parts.append(
-                    f"Adobe OCR was used to convert this {type_label} PDF, "
-                    f"but the converted text still did not contain recognizable "
-                    f"financial statement titles."
-                )
-            elif is_adobe_available():
-                _diag_parts.append(
-                    f"This PDF is {type_label} and Adobe OCR conversion failed. "
-                    f"The original PDF has no extractable text for page identification."
-                )
-            else:
-                _diag_parts.append(
-                    f"This PDF is {type_label} — text cannot be extracted directly. "
-                    f"Adobe OCR API is not configured. "
-                    f"Set ADOBE_CLIENT_ID and ADOBE_CLIENT_SECRET environment variables "
-                    f"to enable automatic conversion of non-text PDFs."
-                )
-        else:
-            _diag_parts.append(
-                "The PDF appears to be text-based but no financial statement "
-                "titles were found by any identification method."
-            )
-
+        # Build a diagnostic error message.
+        # Note: if the PDF was scanned/vector without Adobe, we already
+        # raised above in Step 0. If we get here, either:
+        # - The PDF is text-based but has no recognizable P&L titles
+        # - Adobe converted the PDF but OCR text doesn't match P&L patterns
         methods_tried = ["Claude API"] if ANTHROPIC_API_KEY else []
         methods_tried.append("regex title matching")
         methods_tried.append("content-based scoring")
-        _diag_parts.append(
-            f"Methods tried: {', '.join(methods_tried)}."
-        )
 
-        if warnings:
-            _diag_parts.append(f"Warnings: {'; '.join(warnings)}")
-
-        raise ValueError(" ".join(_diag_parts))
+        if converted_pdf_path:
+            # Adobe converted the PDF but still couldn't find P&L
+            raise ValueError(
+                f"Could not find a P&L (Statement of Profit and Loss) page. "
+                f"This {pdf_type} PDF was converted via Adobe OCR, but the "
+                f"converted text did not contain recognizable financial statement "
+                f"titles. Methods tried: {', '.join(methods_tried)}. "
+                f"The OCR quality may be insufficient for this document."
+            )
+        else:
+            raise ValueError(
+                f"Could not find a P&L (Statement of Profit and Loss) page. "
+                f"PDF type: {pdf_type}. "
+                f"Methods tried: {', '.join(methods_tried)}. "
+                f"Please ensure this is an annual report with financial statements."
+            )
 
     # ------------------------------------------------------------------
     # Step 1b: Check for multiple standalone P&L candidates and warn
@@ -444,29 +430,18 @@ def _run_extraction(pdf_path: str, job_id: str) -> dict:
             logger.warning(f"[{job_id}] pymupdf4llm fallback also failed: {e2}")
 
     if not pnl or not pnl.get('items'):
-        _extract_diag = [
-            f"Could not extract any P&L line items from page {pages['pnl'] + 1}.",
-            f"PDF type: {pdf_type}.",
-        ]
         if converted_pdf_path:
-            _extract_diag.append(
-                "Adobe OCR was used to convert the PDF, but the table structure "
-                "could not be parsed by either Docling or pymupdf4llm."
-            )
-        elif pdf_type in ("scanned", "vector_outlined"):
-            _extract_diag.append(
-                "The PDF has no extractable text. Table extraction requires "
-                "readable text. Configure Adobe OCR (ADOBE_CLIENT_ID / "
-                "ADOBE_CLIENT_SECRET) to convert this PDF automatically."
+            raise ValueError(
+                f"Could not extract P&L line items from page {pages['pnl'] + 1}. "
+                f"Adobe OCR converted this {pdf_type} PDF, but the table structure "
+                f"could not be parsed. The OCR quality may be insufficient."
             )
         else:
-            _extract_diag.append(
-                "Both Docling and pymupdf4llm failed to extract tables. "
-                "The PDF table layout may be unsupported."
+            raise ValueError(
+                f"Could not extract P&L line items from page {pages['pnl'] + 1}. "
+                f"Both Docling and pymupdf4llm failed to parse the table structure. "
+                f"The PDF layout may be unsupported."
             )
-        if warnings:
-            _extract_diag.append(f"Warnings: {'; '.join(warnings)}")
-        raise ValueError(" ".join(_extract_diag))
 
     if company_name:
         pnl['company'] = company_name

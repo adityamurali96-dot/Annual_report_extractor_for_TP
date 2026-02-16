@@ -139,20 +139,16 @@ def identify_pages(pdf_path: str) -> dict:
             empty_page_count += 1
 
     # If most pages are empty, the PDF is likely scanned/vector-outlined
-    # without successful OCR conversion
+    # without successful OCR conversion. This error is caught by
+    # _run_extraction and the pipeline falls through to regex/scoring.
     if empty_page_count > len(all_pages) * 0.8:
         logger.error(
             f"[identify_pages] {empty_page_count}/{len(all_pages)} pages "
             f"have no extractable text. PDF may be scanned or vector-outlined."
         )
         raise ValueError(
-            f"Cannot identify financial statement pages: "
             f"{empty_page_count} of {len(all_pages)} pages have no readable text. "
-            f"This PDF may be scanned, image-based, or have fonts converted to "
-            f"vector outlines. Solutions: (1) Configure Adobe OCR by setting "
-            f"ADOBE_CLIENT_ID and ADOBE_CLIENT_SECRET environment variables for "
-            f"automatic conversion, (2) ensure Tesseract OCR is installed for "
-            f"basic scanned PDF support, or (3) use a text-based PDF."
+            f"PDF may be scanned or have outlined fonts."
         )
 
     # Send in batches if too many pages
