@@ -8,4 +8,7 @@ opencv-python-headless==4.9.0.80
 docling>=2.31.0,<3.0.0
 anthropic>=0.42.0,<1.0.0
 easyocr>=1.7.0,<2.0.0
-pdfservices-sdk>=4.0.0
+pymupdf4llm>=0.0.12
+# Optional: Adobe PDF Services SDK for OCR of scanned/vector-outlined PDFs.
+# Only needed if you set ADOBE_CLIENT_ID and ADOBE_CLIENT_SECRET.
+# Install separately: pip install pdfservices-sdk>=4.0.0

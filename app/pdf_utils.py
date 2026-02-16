@@ -226,7 +226,9 @@ def classify_pdf(pdf_path: str) -> str:
 
     # Decision logic:
     # If majority of pages have text → normal PDF
-    if text_pages > sampled * 0.5:
+    # Use >= to avoid misclassifying borderline PDFs (e.g. text PDFs with
+    # chart/image pages) as scanned when exactly 50% of pages have text.
+    if text_pages >= sampled * 0.5:
         return "text"
     # If any vector pages detected and they outnumber or equal image pages
     if vector_pages > 0 and vector_pages >= image_pages:
