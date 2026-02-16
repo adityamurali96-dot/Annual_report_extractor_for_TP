@@ -54,16 +54,23 @@ def _cleanup_old_files(max_age_seconds: int = 3600):
 @app.get("/", response_class=HTMLResponse)
 async def index(request: Request):
     """Serve the upload page."""
+    from app.adobe_converter import is_adobe_available
     return templates.TemplateResponse("index.html", {
         "request": request,
         "has_api_key": bool(ANTHROPIC_API_KEY),
+        "has_adobe_ocr": is_adobe_available(),
     })
 
 
 @app.get("/health")
 async def health():
     """Health check for Railway."""
-    return {"status": "ok", "api_key_configured": bool(ANTHROPIC_API_KEY)}
+    from app.adobe_converter import is_adobe_available
+    return {
+        "status": "ok",
+        "api_key_configured": bool(ANTHROPIC_API_KEY),
+        "adobe_ocr_configured": is_adobe_available(),
+    }
 
 
 @app.post("/extract")
@@ -133,11 +140,21 @@ async def extract(files: List[UploadFile] = File(...)):
             })
         except ValueError as e:
             # ValueError = known failures (no P&L found, no tables, etc.)
+            # These already contain comprehensive diagnostic info
             logger.warning(f"[{job_id}] Known failure for {file.filename}: {e}")
             if pdf_path.exists():
                 pdf_path.unlink()
             raise HTTPException(
                 422,
+                f"{file.filename}: {str(e)}"
+            ) from e
+        except RuntimeError as e:
+            # RuntimeError = configuration issues (missing SDK, bad credentials)
+            logger.error(f"[{job_id}] Configuration error for {file.filename}: {e}")
+            if pdf_path.exists():
+                pdf_path.unlink()
+            raise HTTPException(
+                500,
                 f"{file.filename}: {str(e)}"
             ) from e
         except Exception as e:
@@ -146,7 +163,7 @@ async def extract(files: List[UploadFile] = File(...)):
                 pdf_path.unlink()
             raise HTTPException(
                 500,
-                f"{file.filename}: An unexpected error occurred. "
+                f"{file.filename}: An unexpected error occurred ({type(e).__name__}). "
                 f"Please try a different PDF or contact support."
             ) from e
         finally:
@@ -240,16 +257,24 @@ def _run_extraction(pdf_path: str, job_id: str) -> dict:
                 )
             except Exception as e:
                 logger.error(f"[{job_id}] Adobe OCR failed: {e}")
-                warnings.append(
-                    f"Adobe OCR conversion failed ({str(e)[:100]}). "
-                    f"Attempting extraction on original PDF."
-                )
+                raise ValueError(
+                    f"This PDF is {type_label} and cannot be read directly. "
+                    f"Adobe OCR conversion was attempted but failed: {str(e)[:150]}. "
+                    f"Please try re-uploading, or use a text-based PDF."
+                ) from e
         else:
-            logger.warning(f"[{job_id}] PDF is {type_label} but Adobe API not configured.")
-            warnings.append(
-                f"PDF detected as {type_label}. Text cannot be extracted directly. "
-                f"Adobe OCR API is not configured. "
-                f"Set ADOBE_CLIENT_ID and ADOBE_CLIENT_SECRET for automatic conversion."
+            # No Adobe credentials — fail immediately with clear instructions.
+            # There's no point trying regex/Claude on a PDF with no text.
+            logger.error(
+                f"[{job_id}] PDF is {type_label} but Adobe OCR is not configured. "
+                f"Cannot proceed."
+            )
+            raise ValueError(
+                f"This PDF is {type_label} — it contains no extractable text. "
+                f"To process this type of PDF, configure Adobe OCR by setting "
+                f"ADOBE_CLIENT_ID and ADOBE_CLIENT_SECRET environment variables in Railway. "
+                f"Get free credentials (500 documents/month) at: "
+                f"https://acrobatservices.adobe.com/dc-integration-creation-app-cdn/main.html"
             )
 
     scanned = is_scanned_pdf(pdf_path)
@@ -330,10 +355,31 @@ def _run_extraction(pdf_path: str, job_id: str) -> dict:
             logger.info(f"[{job_id}] Content scoring found P&L at page {scored_pages.get('pnl', '?')}")
 
     if "pnl" not in pages:
-        raise ValueError(
-            "Could not find a P&L (Statement of Profit and Loss) page. "
-            "Please ensure the PDF is an annual report with financial statements."
-        )
+        # Build a diagnostic error message.
+        # Note: if the PDF was scanned/vector without Adobe, we already
+        # raised above in Step 0. If we get here, either:
+        # - The PDF is text-based but has no recognizable P&L titles
+        # - Adobe converted the PDF but OCR text doesn't match P&L patterns
+        methods_tried = ["Claude API"] if ANTHROPIC_API_KEY else []
+        methods_tried.append("regex title matching")
+        methods_tried.append("content-based scoring")
+
+        if converted_pdf_path:
+            # Adobe converted the PDF but still couldn't find P&L
+            raise ValueError(
+                f"Could not find a P&L (Statement of Profit and Loss) page. "
+                f"This {pdf_type} PDF was converted via Adobe OCR, but the "
+                f"converted text did not contain recognizable financial statement "
+                f"titles. Methods tried: {', '.join(methods_tried)}. "
+                f"The OCR quality may be insufficient for this document."
+            )
+        else:
+            raise ValueError(
+                f"Could not find a P&L (Statement of Profit and Loss) page. "
+                f"PDF type: {pdf_type}. "
+                f"Methods tried: {', '.join(methods_tried)}. "
+                f"Please ensure this is an annual report with financial statements."
+            )
 
     # ------------------------------------------------------------------
     # Step 1b: Check for multiple standalone P&L candidates and warn
@@ -384,10 +430,18 @@ def _run_extraction(pdf_path: str, job_id: str) -> dict:
             logger.warning(f"[{job_id}] pymupdf4llm fallback also failed: {e2}")
 
     if not pnl or not pnl.get('items'):
-        raise ValueError(
-            f"Could not extract any P&L line items from page {pages['pnl']}. "
-            f"The PDF table structure may not be supported."
-        )
+        if converted_pdf_path:
+            raise ValueError(
+                f"Could not extract P&L line items from page {pages['pnl'] + 1}. "
+                f"Adobe OCR converted this {pdf_type} PDF, but the table structure "
+                f"could not be parsed. The OCR quality may be insufficient."
+            )
+        else:
+            raise ValueError(
+                f"Could not extract P&L line items from page {pages['pnl'] + 1}. "
+                f"Both Docling and pymupdf4llm failed to parse the table structure. "
+                f"The PDF layout may be unsupported."
+            )
 
     if company_name:
         pnl['company'] = company_name
