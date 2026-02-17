@@ -263,18 +263,17 @@ def _run_extraction(pdf_path: str, job_id: str) -> dict:
                     f"Please try re-uploading, or use a text-based PDF."
                 ) from e
         else:
-            # No Adobe credentials — fail immediately with clear instructions.
-            # There's no point trying regex/Claude on a PDF with no text.
-            logger.error(
-                f"[{job_id}] PDF is {type_label} but Adobe OCR is not configured. "
-                f"Cannot proceed."
+            # Do not fail immediately. Classification can be conservative and
+            # some "scanned/vector" reports still have enough readable text on
+            # financial pages. Continue with extraction and only fail later if
+            # statement detection/table extraction truly cannot proceed.
+            logger.warning(
+                f"[{job_id}] PDF classified as {type_label}, but Adobe OCR is not configured. "
+                f"Proceeding with built-in extraction as best effort."
             )
-            raise ValueError(
-                f"This PDF is {type_label} — it contains no extractable text. "
-                f"To process this type of PDF, configure Adobe OCR by setting "
-                f"ADOBE_CLIENT_ID and ADOBE_CLIENT_SECRET environment variables in Railway. "
-                f"Get free credentials (500 documents/month) at: "
-                f"https://acrobatservices.adobe.com/dc-integration-creation-app-cdn/main.html"
+            warnings.append(
+                f"PDF was detected as {type_label}, but Adobe OCR is not configured. "
+                f"Tried built-in extraction/OCR fallback; please verify output carefully."
             )
 
     scanned = is_scanned_pdf(pdf_path)

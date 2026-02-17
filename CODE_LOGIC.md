@@ -145,11 +145,12 @@ Line 215-225: Import all modules lazily (inside function, not at module level)
 --- STEP 0: PDF Classification (Lines 234-283) ---
 
 Line 236:    classify_pdf(pdf_path) → "text", "scanned", or "vector_outlined"
-Line 239-275: If scanned or vector_outlined:
+Line 239-281: If scanned or vector_outlined:
               - If Adobe credentials available → convert via Adobe OCR API
               - If Adobe fails → raise ValueError with Adobe error message
-              - If no Adobe credentials → raise ValueError immediately
-                (fail fast — no point trying regex on empty text)
+              - If no Adobe credentials → continue in best-effort mode
+                (do NOT fail fast; run built-in extraction + fallback chain)
+              - Adds a warning so users can verify OCR-sensitive outputs
 Line 277-283: Secondary scanned check for hybrid PDFs
               (is_scanned_pdf adds a warning about OCR accuracy)
 
@@ -264,9 +265,11 @@ Line 169-214: For each sampled page, classify it:
                 (Scanned/photographed pages. Only images > 50KB count
                  to filter out logos/watermarks/decorations.)
 
-Line 224-239: Decision logic:
-              - >= 50% text pages → "text" (normal PDF)
-              - vector pages exist AND >= image pages → "vector_outlined"
+Line 224-244: Decision logic:
+              - >= 35% sampled pages with text (and at least 2 pages) → "text"
+                to avoid false positives on image-heavy but searchable reports
+              - Strong vector signal required before "vector_outlined"
+                (>= 35% vector pages and at least 3 vector-heavy pages)
               - image pages exist → "scanned"
               - < 30% text pages → "vector_outlined" (edge case fallback)
               - Default → "text" (let the pipeline try)

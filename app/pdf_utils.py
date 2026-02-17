@@ -225,13 +225,19 @@ def classify_pdf(pdf_path: str) -> str:
     )
 
     # Decision logic:
-    # If majority of pages have text → normal PDF
-    # Use >= to avoid misclassifying borderline PDFs (e.g. text PDFs with
-    # chart/image pages) as scanned when exactly 50% of pages have text.
-    if text_pages >= sampled * 0.5:
+    # If a strong minority of sampled pages already has extractable text,
+    # treat as text. This avoids false positives on normal annual reports
+    # where many pages are image-heavy (covers/charts) but financial pages
+    # still contain machine-readable text.
+    if text_pages >= max(2, int(sampled * 0.35)):
         return "text"
-    # If any vector pages detected and they outnumber or equal image pages
-    if vector_pages > 0 and vector_pages >= image_pages:
+
+    # Classify as vector-outlined only when it's a strong signal.
+    # A couple of vector-heavy pages are common in normal reports.
+    strong_vector_signal = vector_pages >= max(3, int(sampled * 0.35))
+
+    # If strong vector pages detected and they outnumber or equal images
+    if strong_vector_signal and vector_pages >= image_pages:
         return "vector_outlined"
     # If scanned pages found
     if image_pages > 0:
